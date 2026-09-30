@@ -1,0 +1,217 @@
+name: Build PonWrt Firmware
+
+# 手动触发编译并发布到 GitHub Releases。
+# 使用方法：仓库 Actions 页 -> Build PonWrt Firmware -> Run workflow，
+# 默认只编译 AN7581 平台（含 FiberHome HG5382A），产物自动发布为 Release。
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_an7581:
+        description: '编译 AN7581 平台 (HG5382A / HG5585F / XG2010G / Nokia / ZNXT / UNG00A 等)'
+        required: true
+        default: true
+        type: boolean
+      build_an7583:
+        description: '编译 AN7583 平台 (Nokia XG-040G-MF)'
+        required: true
+        default: false
+        type: boolean
+      create_release:
+        description: '发布到 GitHub Releases (关闭则仅保存为 artifact)'
+        required: true
+        default: true
+        type: boolean
+      include_packages:
+        description: '同时上传离线软件仓库 (tar.zst, 体积较大)'
+        required: true
+        default: false
+        type: boolean
+      release_tag:
+        description: 'Release 标签 (留空则自动使用 ponwrt-r<构建编号>)'
+        required: false
+        default: ''
+        type: string
+      prerelease:
+        description: '标记为预发布版本'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-ponwrt-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    if: ${{ (matrix.target == 'an7581' && inputs.build_an7581) || (matrix.target == 'an7583' && inputs.build_an7583) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - an7581
+          - an7583
+
+    steps:
+      - name: Free build space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk \
+            gettext git g++-multilib gcc-multilib gperf help2man intltool \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev lld llvm ninja-build p7zip-full patch pkgconf \
+            python3 python3-docutils python3-pip python3-ply python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs unzip wget xmlto xxd zlib1g-dev zstd
+
+      - name: Cache downloaded sources
+        uses: actions/cache@v4
+        with:
+          path: dl
+          key: ponwrt-dl-${{ matrix.target }}-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
+          restore-keys: |
+            ponwrt-dl-${{ matrix.target }}-
+
+      - name: Install feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Configure ${{ matrix.target }}
+        run: |
+          ./scripts/kconfig.pl + \
+            "configs/${{ matrix.target }}.config" \
+            configs/release.config > .config
+          make defconfig
+
+      - name: Download sources
+        run: |
+          make download -j"$(nproc)" || make download -j1
+
+      - name: Build firmware
+        run: |
+          make -j"$(nproc)" || { \
+            echo "::group::verbose retry log"; \
+            make -j1 V=s; \
+            echo "::endgroup::"; \
+            exit 1; \
+          }
+
+      - name: Collect firmware images
+        run: |
+          IMGDIR="bin/targets/airoha/${{ matrix.target }}"
+          mkdir -p firmware
+          cp -v "$IMGDIR"/*-sysupgrade.itb firmware/
+          cp -v "$IMGDIR"/*-recovery.itb firmware/ || true
+          cp -v "$IMGDIR"/*.manifest firmware/ || true
+          cp -v "$IMGDIR"/sha256sums "firmware/sha256sums-${{ matrix.target }}" || true
+          cp -v "$IMGDIR"/config.buildinfo "firmware/config.buildinfo-${{ matrix.target }}" || true
+
+          ls firmware/*-sysupgrade.itb >/dev/null 2>&1 || { \
+            echo "::error::no sysupgrade image produced"; exit 1; \
+          }
+
+          if [ "${{ inputs.include_packages }}" = "true" ]; then
+            tar --zstd -cf "firmware/packages-${{ matrix.target }}.tar.zst" \
+              -C bin/targets/airoha "${{ matrix.target }}"
+          fi
+
+          echo "=== collected images ==="
+          ls -lh firmware/
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.target }}
+          path: firmware/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: ${{ inputs.create_release }}
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download firmware
+        uses: actions/download-artifact@v4
+        with:
+          pattern: firmware-*
+          path: firmware
+          merge-multiple: true
+
+      - name: Generate release notes
+        run: |
+          DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
+          DOC_URL="https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/docs/FLASHING.md"
+          SHORT_SHA="${GITHUB_SHA::12}"
+
+          {
+            echo "## PonWrt 固件自动构建"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| 构建编号 | r${{ github.run_number }} |"
+            echo "| 源码版本 | \`$SHORT_SHA\` |"
+            echo "| 构建时间 | $DATE |"
+            echo "| 构建配置 | an7581/an7583 全设备 + release.config (nft-offload/CAKE/BBR/WireGuard/UPnP) |"
+            echo ""
+            echo "### 固件清单"
+            echo ""
+            for f in firmware/*-sysupgrade.itb; do
+              echo "- \`$(basename "$f")\` ($(du -h "$f" | cut -f1))"
+            done
+            echo ""
+            echo "各文件用途：\`*-sysupgrade.itb\` 为正式刷机镜像；\`*-recovery.itb\` 为恢复镜像；\`*.manifest\` 为软件包清单；\`sha256sums-*\` 为校验值。"
+            echo ""
+            echo "### 刷机步骤（摘要，详细教程见 [docs/FLASHING.md]($DOC_URL)）"
+            echo ""
+            echo "1. 从 [uboot-an758x Releases](https://github.com/pbs05/uboot-an758x/releases) 下载对应机型的 \`*-firstblock.bin\`（或 \`*-preloader.bin\`）与 \`*-bl31-u-boot.fip\`；从 [an758x-stock2ubi Releases](https://github.com/pbs05/an758x-stock2ubi/releases) 下载 \`an758x-stock2ubi\`。"
+            echo "2. 原厂系统开启 shell，运行 \`an758x-stock2ubi\`，在 \`http://<光猫IP>:3333/\` **全量备份所有分区**（尤其 \`factory\`，含 PON 序列号与光模块校准，丢失难以恢复）。"
+            echo "3. 上传 firstblock/preloader 与 bl31-u-boot.fip 写入 U-Boot，重启进入 \`http://192.168.0.1/\` 恢复页。"
+            echo "4. 首次安装：重建 UBI → 写入 fip → 恢复板级数据卷（烽火机型先用 [fiberhome-factory](https://github.com/pbs05/fiberhome-factory) 将备份转换为 1 MiB 镜像）→ 上传本页的 sysupgrade.itb → 启动系统。"
+            echo "5. 进 LuCI（网络 → PON）核对 board data，在 \`/etc/config/pon\` 配置与原厂一致的 PON 模式和认证信息（SN/LOID）。"
+            echo ""
+            echo "> ⚠️ 刷机有变砖风险，第 2 步的全量备份是唯一救命稻草，请妥善保存到光猫以外的位置。"
+          } > release_notes.md
+
+          echo "=== release notes ==="
+          cat release_notes.md
+
+      - name: Resolve release tag
+        run: |
+          TAG="${{ inputs.release_tag }}"
+          [ -z "$TAG" ] && TAG="ponwrt-r${{ github.run_number }}"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: PonWrt 固件 ${{ env.TAG }}
+          body_path: release_notes.md
+          prerelease: ${{ inputs.prerelease }}
+          files: firmware/*

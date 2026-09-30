@@ -69,6 +69,18 @@ make -j$(nproc)
 
 固件位于 `bin/targets/airoha/an7581/` 或 `bin/targets/airoha/an7583/`。
 
+## 使用 GitHub Actions 自动编译（本 Fork）
+
+本仓库内置了自动编译工作流，无需本地 Linux 环境：
+
+1. 打开仓库 **Actions** 页 → 选择 **Build PonWrt Firmware** → **Run workflow**；
+2. 默认只编译 AN7581 平台（含 FiberHome HG5382A），可勾选 AN7583 或调整 Release 选项；
+3. 编译约需 2～3 小时，完成后固件自动发布到 **Releases**
+   （`*-sysupgrade.itb` 为正式刷机镜像，Release 页附有刷机步骤摘要）。
+
+详细刷机教程（备份、U-Boot 写入、factory 数据恢复、PON 配置、桥接拨号）见
+[docs/FLASHING.md](docs/FLASHING.md)。
+
 ## 刷入
 
 使用 [AN758x-Stock2UBI](https://github.com/pbs05/an758x-stock2ubi) 备份原厂闪存并安装 UBI 布局。启动镜像和 Web 恢复界面由 [AN758x U-Boot](https://github.com/pbs05/uboot-an758x) 提供。
