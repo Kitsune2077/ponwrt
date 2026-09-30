@@ -46,17 +46,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
+  build-an7581:
+    name: Build AN7581 firmware
+    if: ${{ inputs.build_an7581 }}
     runs-on: ubuntu-24.04
     timeout-minutes: 350
-    if: ${{ (matrix.target == 'an7581' && inputs.build_an7581) || (matrix.target == 'an7583' && inputs.build_an7583) }}
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - an7581
-          - an7583
 
     steps:
       - name: Free build space
@@ -90,20 +84,18 @@ jobs:
         uses: actions/cache@v4
         with:
           path: dl
-          key: ponwrt-dl-${{ matrix.target }}-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
+          key: ponwrt-dl-an7581-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
           restore-keys: |
-            ponwrt-dl-${{ matrix.target }}-
+            ponwrt-dl-an7581-
 
       - name: Install feeds
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Configure ${{ matrix.target }}
+      - name: Configure an7581
         run: |
-          ./scripts/kconfig.pl + \
-            "configs/${{ matrix.target }}.config" \
-            configs/release.config > .config
+          ./scripts/kconfig.pl + configs/an7581.config configs/release.config > .config
           make defconfig
 
       - name: Download sources
@@ -121,21 +113,21 @@ jobs:
 
       - name: Collect firmware images
         run: |
-          IMGDIR="bin/targets/airoha/${{ matrix.target }}"
+          IMGDIR="bin/targets/airoha/an7581"
           mkdir -p firmware
           cp -v "$IMGDIR"/*-sysupgrade.itb firmware/
           cp -v "$IMGDIR"/*-recovery.itb firmware/ || true
           cp -v "$IMGDIR"/*.manifest firmware/ || true
-          cp -v "$IMGDIR"/sha256sums "firmware/sha256sums-${{ matrix.target }}" || true
-          cp -v "$IMGDIR"/config.buildinfo "firmware/config.buildinfo-${{ matrix.target }}" || true
+          cp -v "$IMGDIR"/sha256sums firmware/sha256sums-an7581 || true
+          cp -v "$IMGDIR"/config.buildinfo firmware/config.buildinfo-an7581 || true
 
           ls firmware/*-sysupgrade.itb >/dev/null 2>&1 || { \
             echo "::error::no sysupgrade image produced"; exit 1; \
           }
 
           if [ "${{ inputs.include_packages }}" = "true" ]; then
-            tar --zstd -cf "firmware/packages-${{ matrix.target }}.tar.zst" \
-              -C bin/targets/airoha "${{ matrix.target }}"
+            tar --zstd -cf firmware/packages-an7581.tar.zst \
+              -C bin/targets/airoha an7581
           fi
 
           echo "=== collected images ==="
@@ -144,15 +136,110 @@ jobs:
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-${{ matrix.target }}
+          name: firmware-an7581
+          path: firmware/*
+          if-no-files-found: error
+          retention-days: 14
+
+  build-an7583:
+    name: Build AN7583 firmware
+    if: ${{ inputs.build_an7583 }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Free build space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk \
+            gettext git g++-multilib gcc-multilib gperf help2man intltool \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev lld llvm ninja-build p7zip-full patch pkgconf \
+            python3 python3-docutils python3-pip python3-ply python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs unzip wget xmlto xxd zlib1g-dev zstd
+
+      - name: Cache downloaded sources
+        uses: actions/cache@v4
+        with:
+          path: dl
+          key: ponwrt-dl-an7583-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
+          restore-keys: |
+            ponwrt-dl-an7583-
+
+      - name: Install feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Configure an7583
+        run: |
+          ./scripts/kconfig.pl + configs/an7583.config configs/release.config > .config
+          make defconfig
+
+      - name: Download sources
+        run: |
+          make download -j"$(nproc)" || make download -j1
+
+      - name: Build firmware
+        run: |
+          make -j"$(nproc)" || { \
+            echo "::group::verbose retry log"; \
+            make -j1 V=s; \
+            echo "::endgroup::"; \
+            exit 1; \
+          }
+
+      - name: Collect firmware images
+        run: |
+          IMGDIR="bin/targets/airoha/an7583"
+          mkdir -p firmware
+          cp -v "$IMGDIR"/*-sysupgrade.itb firmware/
+          cp -v "$IMGDIR"/*-recovery.itb firmware/ || true
+          cp -v "$IMGDIR"/*.manifest firmware/ || true
+          cp -v "$IMGDIR"/sha256sums firmware/sha256sums-an7583 || true
+          cp -v "$IMGDIR"/config.buildinfo firmware/config.buildinfo-an7583 || true
+
+          ls firmware/*-sysupgrade.itb >/dev/null 2>&1 || { \
+            echo "::error::no sysupgrade image produced"; exit 1; \
+          }
+
+          if [ "${{ inputs.include_packages }}" = "true" ]; then
+            tar --zstd -cf firmware/packages-an7583.tar.zst \
+              -C bin/targets/airoha an7583
+          fi
+
+          echo "=== collected images ==="
+          ls -lh firmware/
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-an7583
           path: firmware/*
           if-no-files-found: error
           retention-days: 14
 
   release:
     name: Create GitHub Release
-    needs: build
-    if: ${{ inputs.create_release }}
+    needs: [build-an7581, build-an7583]
+    if: ${{ inputs.create_release && !failure() && !cancelled() }}
     runs-on: ubuntu-24.04
 
     steps:
@@ -168,6 +255,7 @@ jobs:
           DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
           DOC_URL="https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/docs/FLASHING.md"
           SHORT_SHA="${GITHUB_SHA::12}"
+          TARGETS=$(ls firmware/sha256sums-* 2>/dev/null | sed 's/.*sha256sums-//' | tr '\n' ' ')
 
           {
             echo "## PonWrt 固件自动构建"
@@ -177,7 +265,8 @@ jobs:
             echo "| 构建编号 | r${{ github.run_number }} |"
             echo "| 源码版本 | \`$SHORT_SHA\` |"
             echo "| 构建时间 | $DATE |"
-            echo "| 构建配置 | an7581/an7583 全设备 + release.config (nft-offload/CAKE/BBR/WireGuard/UPnP) |"
+            echo "| 目标平台 | $TARGETS |"
+            echo "| 构建配置 | 全设备 profile + release.config (nft-offload/CAKE/BBR/WireGuard/UPnP) |"
             echo ""
             echo "### 固件清单"
             echo ""
