@@ -100,21 +100,71 @@ HG5382A 硬件概况（刷机前先了解）：
 
 ## 6. 桥接给下游路由器拨号（可选，2.5G 口跑满千兆以上带宽）
 
-HG5382A 的 2.5G 口（`lan1`）与光口（`pon0`）都是独立的标准网口，做二层桥即可。
-`/etc/config/network` 示例（纯透传，光猫不拨号）：
+光猫做纯二层透传、由下游路由器 PPPoE 拨号时，需要把**光口 `pon0`** 与**2.5G 网口**
+桥成一个**不带任何三层配置的桥**。多数机型（HG5382A、Nokia XG-040G-MD 等）的 2.5G 口
+在系统里叫 `lan1`，下文以 `lan1` 为例；其它机型先用 `ip -br link` 确认 2.5G 口名再替换。
 
-```uc
-config device
-    option name 'br-wan'
-    option type 'bridge'
-    list ports 'pon0'
-    list ports 'lan1'
+```
+OLT ── pon0 ──[ br-wan（纯二层，无 IP/无协议）]── lan1 ── 下游路由器 WAN（PPPoE 拨号）
+                                          └─ br-lan（其余网口）192.168.1.1，保留管理
 ```
 
-下游路由器 WAN 口接 2.5G 网口（`lan1`）直接 PPPoE 拨号。
+### 6.1 首次安装后的默认配置
 
-若运营商上网业务带 VLAN tag（如 VLAN 100），而下游路由器不方便打 tag，
-在 br-wan 上开启 VLAN 过滤做 tag↔untag 转换：
+首次启动时板级初始化脚本（`etc/board.d/02_network`）会生成：
+
+- `br-lan = lan1 lan2 lan3 lan4`，静态 192.168.1.1/24 并开启 DHCP 服务；
+- `wan = pon0`，协议为 `dhcp`，同时生成一个 `dhcpv6` 的 `wan6` 接口。
+
+也就是说 **`lan1` 默认在 `br-lan` 里、`pon0` 上还跑着 DHCP/DHCPv6 客户端**，两者都要处理掉，
+光猫才不会往运营商二层网络里发自己的 DHCP 请求。
+
+### 6.2 改成纯桥（SSH + UCI）
+
+```sh
+# ① 把 2.5G 口从默认 br-lan 里摘掉，其余网口继续做管理口
+dev=$(uci show network | sed -n "s/^network\.\(.*\)\.name='br-lan'$/\1/p" | head -n1)
+uci -q delete network.$dev.ports
+uci add_list network.$dev.ports='lan2'
+uci add_list network.$dev.ports='lan3'
+uci add_list network.$dev.ports='lan4'
+
+# ② 新建纯二层桥：光口 + 2.5G 口
+uci set network.brwan='device'
+uci set network.brwan.name='br-wan'
+uci set network.brwan.type='bridge'
+uci add_list network.brwan.ports='pon0'
+uci add_list network.brwan.ports='lan1'
+
+# ③ WAN 指向这个桥，并且不给它任何协议/IP
+uci set network.wan.device='br-wan'
+uci set network.wan.proto='none'
+uci -q delete network.wan6
+
+uci commit network
+/etc/init.d/network restart
+```
+
+说明：
+
+- `proto 'none'` 不是"关掉接口"：netifd 仍会把 `br-wan` 及其成员口（含 `pon0`）拉起，
+  这正是 PON 数据通路需要的（板级脚本的注释即"netifd opens pon0 when the wan
+  interface starts"）；
+- `br-wan` 上**不要**配 IP，也**不要**开 DHCP 服务器；
+- 同一个网口不能同时属于两个桥，所以 `lan1` 必须先从 `br-lan` 移除。
+
+### 6.3 LuCI 等效操作
+
+1. **网络 → 接口 → 设备**：编辑 `br-lan`，从端口列表移除 2.5G 口；
+2. 同页新增设备：名称 `br-wan`、类型 `bridge`、端口勾选 `pon0` 与 2.5G 口；
+3. **网络 → 接口**：编辑 `WAN` → 设备选 `br-wan`、协议选「无」；删除 `WAN6`；
+4. 保存并应用。
+
+### 6.4 运营商带 VLAN tag 时
+
+- 下游路由器自己打 tag（最常见）：光猫侧保持上面的纯桥即可，无需任何 VLAN 配置。
+- 需要光猫侧做 tag↔untag 转换（下游设备不方便打 tag）时，在 `br-wan` 上开 VLAN 过滤，
+  `t` 为带 tag 侧、`u*` 为剥 tag 并设 PVID 侧：
 
 ```uc
 config device
@@ -133,6 +183,33 @@ config bridge-vlan
 
 IPTV 等其它业务 VLAN 用固件自带的 LuCI 应用「IPTV」配置更省事。
 
+### 6.5 验证
+
+```sh
+ip -br link                  # br-wan / pon0 / lan1 均应为 UP
+ip -4 addr show br-wan       # 必须为空：桥上不能有 IP
+bridge link show             # pon0 与 2.5G 口应挂在 br-wan 下
+bridge vlan show             # 启用 VLAN 过滤时检查 tag 设置
+pondctl status --line line0  # PON 注册状态（与第 5 节一致）
+```
+
+`pon0` 若未 UP，执行 `ip link set pon0 up`，或 `/etc/init.d/airoha-pond restart`。
+想确认二层真的透传，可在光猫上抓 PPPoE 发现报文（`tcpdump` 随 `airoha-pon-debug` 提供）：
+
+```sh
+tcpdump -i pon0 -n -e 'pppoed or pppoes'
+```
+
+### 6.6 注意事项
+
+- **不要**把 `pon0` 桥进 `br-lan`：运营商的二层网络会和局域网混在一起，光猫的 DHCP
+  服务器还会与运营商侧 DHCP 冲突；
+- 桥接后光猫的管理地址只保留在 `br-lan` 的其它网口上，别把 2.5G 口留在里面；
+- `pon0` 与 2.5G 口是两个独立 GMAC，这条桥由 Linux 软件桥转发（不经过内置交换机的
+  硬件转发），建议用 `iperf3` 实测吞吐，并用 `ethtool -S` 检查有无丢包；
+- 这些配置都在 `/etc/config/network` 中，属于 sysupgrade 保留范围，后续升级固件不会丢
+  （但不要执行 U-Boot 恢复页的"重建 UBI"）。
+
 ## 7. 救砖
 
 - **能进 U-Boot**：上电 1 秒内按住 Reset 进 `http://192.168.0.1/` 重刷；
@@ -149,5 +226,8 @@ IPTV 等其它业务 VLAN 用固件自带的 LuCI 应用「IPTV」配置更省�
 | Nokia XG-040G-MD/TF/MF | `xg-040g-md` / `xg-040g-tf` / `xg-040g-mf` | `bosa`、`ri`（直接写入同名卷，无需转换） |
 | UnionMan UNG00A | `ung00a` | `reservearea` |
 | ZNXT ZN504XG-D / ZN515XG-D | `zn504xg-d` / `zn515xg-d` | `reservearea` |
+
+网口命名以 `ip -br link` 为准：多数机型（HG5382A、Nokia XG-040G-MD 等）的 2.5G 口是
+`lan1`，第 6 节的桥接示例按此编写。
 
 `reservearea` / `dsd` 备份写入 PonWrt 的 `factory` 卷；Nokia 的 `bosa`、`ri` 写入同名卷。
