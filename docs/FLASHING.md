@@ -183,6 +183,14 @@ config bridge-vlan
 
 IPTV 等其它业务 VLAN 用固件自带的 LuCI 应用「IPTV」配置更省事。
 
+原厂光猫页面上的「802.1p / 优先级」在 PonWrt 里没有对应选项：Linux 桥插入 802.1Q 标签时
+P-bit 固定为 0（`bridge vlan` 本身就没有优先级参数），这与绝大多数运营商（含 PPPoE 上网）
+默认的 802.1p = 0 等价。只有 OLT 通过 OMCI 下发「按 VLAN + 802.1p 区分 GEM」的多业务映射时
+才需要非 0 的 P-bit，注册后可用 `cat /sys/class/net/pon0/xpon/data_path` 查看 OLT 给出的映射
+（`pbit_mask` 为 `ff` 表示任意 P-bit）；确需非 0 时，可让下游路由器自己打 tag（把 `lan1:u*`
+改为 `lan1:t` 原样透传），或在光猫上用 tc 的 `vlan` action / VLAN 子接口的 `egress-qos-map`
+显式设置。
+
 ### 6.5 验证
 
 ```sh
@@ -205,8 +213,10 @@ tcpdump -i pon0 -n -e 'pppoed or pppoes'
 - **不要**把 `pon0` 桥进 `br-lan`：运营商的二层网络会和局域网混在一起，光猫的 DHCP
   服务器还会与运营商侧 DHCP 冲突；
 - 桥接后光猫的管理地址只保留在 `br-lan` 的其它网口上，别把 2.5G 口留在里面；
-- `pon0` 与 2.5G 口是两个独立 GMAC，这条桥由 Linux 软件桥转发（不经过内置交换机的
-  硬件转发），建议用 `iperf3` 实测吞吐，并用 `ethtool -S` 检查有无丢包；
+- `pon0` 与 2.5G 口是两个独立 GMAC，L2 转发由内核桥处理；PonWrt 默认开启 flow offload
+  （`flow_offloading` 与 `flow_offloading_hw`，并额外生成 bridge 家族的 flowtable，端口
+  覆盖 `pon0`/`lan1`），桥接流量有机会被卸载到 NPU/PPE。可用 `nft list flowtables` 确认
+  flowtable 是否存在，并用 `iperf3` 实测吞吐、`ethtool -S` 检查有无丢包；
 - 这些配置都在 `/etc/config/network` 中，属于 sysupgrade 保留范围，后续升级固件不会丢
   （但不要执行 U-Boot 恢复页的"重建 UBI"）。
 
