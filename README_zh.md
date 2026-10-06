@@ -81,6 +81,11 @@ make -j$(nproc)
 详细刷机教程（备份、U-Boot 写入、factory 数据恢复、PON 配置、桥接拨号）见
 [docs/FLASHING.md](docs/FLASHING.md)。
 
+如果刷入恢复引导后出现**全灯不亮、`192.168.0.1` 打不开**（部分 HG5382A 的 Winbond
+`W29N02KVSIAF` NAND 存在 ECC 位宽不一致问题），按
+[docs/UNBRICK.md](docs/UNBRICK.md) 用 3.3V TTL + XMODEM 恢复，无需换机；
+`docs/unbrick/` 下附 Windows / Linux 脚本，`docs/images/` 下附接线图与流程图。
+
 ## 刷入
 
 使用 [AN758x-Stock2UBI](https://github.com/pbs05/an758x-stock2ubi) 备份原厂闪存并安装 UBI 布局。启动镜像和 Web 恢复界面由 [AN758x U-Boot](https://github.com/pbs05/uboot-an758x) 提供。

@@ -19,6 +19,11 @@
 | `an758x-stock2ubi` | [an758x-stock2ubi Releases](https://github.com/pbs05/an758x-stock2ubi/releases) | 原厂系统内使用的免拆刷入工具（aarch64） |
 | FiberHome Factory 工具 | [fiberhome-factory](https://github.com/pbs05/fiberhome-factory) | 烽火 factory 镜像转换（GUI，Windows/macOS/Linux） |
 
+uboot-an758x 请使用 **v2026.07-4 或更新**：更早的版本对 Winbond `W29N02KVSIAF`（部分 HG5382A
+批次使用的 NAND）按错误的 ECC 位宽处理该芯片，配合 Stock2UBI 免拆刷入会导致设备读不到 `fip` 卷，
+表现为“全灯不亮、`192.168.0.1` 打不开”。遇到这种情况不必换机，按
+[救砖指南](UNBRICK.md) 走一遍串口恢复即可。
+
 HG5382A 硬件概况（刷机前先了解）：
 
 - SoC：Airoha AN7581，四核 Cortex-A53 + NPU 硬件转发，512MB 内存，并联 NAND
@@ -54,15 +59,19 @@ HG5382A 硬件概况（刷机前先了解）：
 
 ## 3. U-Boot Web 首次安装
 
-1. 重启后电脑网线连光猫，访问 `http://192.168.0.1/` 进入 U-Boot 恢复界面
-   （首次出现页面可能需要约 1 分钟；之后也可用**上电约 1 秒内按住 Reset** 进入）；
+1. 重启后电脑网线连光猫的 **`lan2` / `lan3` / `lan4`**（U-Boot 只启用内部交换机 `gdm1`，
+   2.5G 的 `lan1` 要到 Linux 阶段才可用），访问 `http://192.168.0.1/` 进入 U-Boot 恢复界面
+   （首次出现页面可能需要约 1 分钟；之后也可用**上电约 1 秒内按住 Reset** 进入）。
+   PC 侧可以用 DHCP（U-Boot 自带 DHCP 服务，地址池 `192.168.0.100-199`）或静态 `192.168.0.x/24`；
 2. 按顺序操作：
    1. **重建 UBI**；
-   2. **写入 `bl31-u-boot.fip`**；
-   3. **恢复板级数据卷**（见第 4 节，转换后的 factory 镜像写入 `factory` 卷）；
-   4. **上传 sysupgrade 镜像**：选择本仓库 Releases 里的
+   2. **写入 BL2**（`*-preloader.bin` 或 `*-firstblock.bin`，两者等价）——
+      漏掉这一步，重启后 BL2 仍会因首块 ECC 不一致而读不到 `fip` 卷；
+   3. **写入 `bl31-u-boot.fip`**；
+   4. **恢复板级数据卷**（见第 4 节，转换后的 factory 镜像写入 `factory` 卷）；
+   5. **上传 sysupgrade 镜像**：选择本仓库 Releases 里的
       `*-fiberhome_hg5382a-sysupgrade.itb`；
-   5. **启动系统**。
+   6. **启动系统**。
 
 ## 4. factory 数据转换与恢复
 
@@ -222,9 +231,14 @@ tcpdump -i pon0 -n -e 'pppoed or pppoes'
 
 ## 7. 救砖
 
-- **能进 U-Boot**：上电 1 秒内按住 Reset 进 `http://192.168.0.1/` 重刷；
-- **完全无响应**：TTL 串口（115200）+ XMODEM 方式恢复，见
-  [uboot-an758x README](https://github.com/pbs05/uboot-an758x)「手动刷机」一节。
+| 情况 | 处理 |
+| --- | --- |
+| 能进 U-Boot 恢复页 | 上电 1 秒内按住 Reset 进 `http://192.168.0.1/` 重刷（网线插 `lan2`/`lan3`/`lan4`） |
+| 全灯不亮、`192.168.0.1` 打不开，串口停在 `Press x to load BL31 + U-Boot FIP via XMODEM` | 按 **[docs/UNBRICK.md](UNBRICK.md)** 用 TTL + XMODEM 把 fip 送进内存，再在恢复页里**重建 UBI 并重刷 BL2 与 fip**（只上传 sysupgrade 会重启又卡回 BL2） |
+| 串口完全无输出 | 只能外部编程器写 NAND，或参考 [uboot-an758x README](https://github.com/pbs05/uboot-an758x)「手动刷机」一节 |
+
+救砖所需的脚本与配图在 `docs/unbrick/` 与 `docs/images/`：`xmodem_send.ps1`（Windows）、
+`xmodem_send.py`（Linux/macOS）、`serial_log.ps1`（抓日志）。
 
 ## 8. 其它机型差异
 
