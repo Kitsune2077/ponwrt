@@ -255,3 +255,33 @@ tcpdump -i pon0 -n -e 'pppoed or pppoes'
 `lan1`，第 6 节的桥接示例按此编写。
 
 `reservearea` / `dsd` 备份写入 PonWrt 的 `factory` 卷；Nokia 的 `bosa`、`ri` 写入同名卷。
+
+## 9. 「硬件身份」页与板级身份字段
+
+`luci-app-pon` 的「硬件身份」页由板级脚本声明的 identity 字段驱动（`etc/board.d/03_pon_data`）：
+Nokia 机型写 `ri` 卷的 `pon_sn`/`board_mac`，Gemtek 写 `factory`，FiberHome（HG5382A、HG5585F
+CT/CU）写转换后 `factory` 镜像里的 `0x2000` 基础 MAC、`0x2010` 八字节 PON SN、`0x2020` 设备序列号。
+菜单项由 `/tmp/pon-board-identity.available` 门控，而这个标记文件只能由 `03_pon_data` 创建。
+
+注意：板级探测（`preinit_config_board` → `board_detect`）注册在**挂载 overlay 之前**，启动早期只能
+看到 squashfs 里的脚本。因此
+
+- 用**新镜像刷机**、或 sysupgrade 到新镜像（`/etc/board.json` 不在保留列表里，会由新镜像首启重新
+  生成）都无需额外操作；
+- 只有**手工**把 identity 声明写进 `/etc/board.d/03_pon_data`（落在 overlay）时会踩坑：启动早期看
+  不到它，标记不生成，菜单重启后消失。此时在 `/etc/rc.local` 的 `exit 0` 之前补一行：
+
+  ```sh
+  [ -f /etc/board.json ] && grep -q identity /etc/board.json && touch /tmp/pon-board-identity.available
+  ```
+
+验证：登录 LuCI 后请求 `/cgi-bin/luci/admin/network/pon/hardware`，返回 `200` 表示该节点已注册
+（依赖不满足时 LuCI dispatcher 返回 `404`，可拿一个不存在的路径做对照）。
+
+改动 `factory` 里的 SN/MAC 之前先整份备份 —— 写入工具自己也会把原镜像存到
+`/tmp/pon-board-data.<目标>.<pid>.bin`，但 `/tmp` 重启即失：
+
+```sh
+# 卷号以 /sys/class/ubi/*/name 为准（HG5382A 上是 ubi0_3）
+ssh root@192.168.1.1 "head -c 1048576 /dev/ubi0_3" > factory.bin
+```
