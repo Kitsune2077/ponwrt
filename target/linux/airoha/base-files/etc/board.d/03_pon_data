@@ -51,6 +51,22 @@ esac
 json_close_object
 
 case "$board" in
+fiberhome,hg5382a|fiberhome,hg5585f-ct|fiberhome,hg5585f-cu)
+	identity_available=1
+	json_add_object identity
+	json_add_object targets
+	json_add_object factory
+	json_add_object fields
+	# Converted factory layout, see an7581-fiberhome-ubi-parts.dtsi:
+	# 0x2000 base MAC, 0x2010 eight-byte PON SN, 0x2020 NUL-terminated device serial.
+	identity_field pon_sn pon-sn 8208 8 pon-binary8
+	identity_field board_mac mac 8192 6 mac-binary6
+	identity_field device_sn device-sn 8224 32 serial-text
+	json_close_object
+	json_close_object
+	json_close_object
+	json_close_object
+	;;
 gemtek,xg2010g)
 	identity_available=1
 	json_add_object identity
