@@ -227,7 +227,9 @@ tcpdump -i pon0 -n -e 'pppoed or pppoes'
   覆盖 `pon0`/`lan1`），桥接流量有机会被卸载到 NPU/PPE。可用 `nft list flowtables` 确认
   flowtable 是否存在，并用 `iperf3` 实测吞吐、`ethtool -S` 检查有无丢包；
 - 这些配置都在 `/etc/config/network` 中，属于 sysupgrade 保留范围，后续升级固件不会丢
-  （但不要执行 U-Boot 恢复页的"重建 UBI"）。
+  （但不要执行 U-Boot 恢复页的"重建 UBI"；三条固件更新路径见 [UPGRADE.md](UPGRADE.md)）。
+- 另外**不要把 `lan2`/`lan3`/`lan4` 全部移出 `br-lan`**：U-Boot 阶段只启用内部交换机
+  `gdm1`（就是这三个千兆口），全摘掉之后系统起不来时就没有网口能访问 `192.168.0.1` 了。
 
 ## 7. 救砖
 

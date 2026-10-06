@@ -79,7 +79,9 @@ make -j$(nproc)
    （`*-sysupgrade.itb` 为正式刷机镜像，Release 页附有刷机步骤摘要）。
 
 详细刷机教程（备份、U-Boot 写入、factory 数据恢复、PON 配置、桥接拨号）见
-[docs/FLASHING.md](docs/FLASHING.md)。
+[docs/FLASHING.md](docs/FLASHING.md)；**已刷好设备如何更新固件**（日常 sysupgrade、
+U-Boot 恢复页刷写、引导 BL2+fip 更新，以及哪些卷会被动到）见
+[docs/UPGRADE.md](docs/UPGRADE.md)。
 
 如果刷入恢复引导后出现**全灯不亮、`192.168.0.1` 打不开**（部分 HG5382A 的 Winbond
 `W29N02KVSIAF` NAND 存在 ECC 位宽不一致问题），按

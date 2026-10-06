@@ -79,6 +79,6 @@ Use [AN758x-Stock2UBI](https://github.com/pbs05/an758x-stock2ubi) to back up the
 
 If the board ends up with **no LEDs and no `192.168.0.1`** after installing the recovery bootloader (a NAND ECC mismatch on Winbond `W29N02KVSIAF` units, where the stock chain writes 8-bit BCH but the released BL2 decodes `ECC4/512`), follow [docs/UNBRICK.md](docs/UNBRICK.md): attach a 3.3V USB-TTL adapter and upload the FIP over XMODEM with the scripts in `docs/unbrick/`, then rebuild UBI and write BL2 + FIP + sysupgrade from the web page. Wiring and flow diagrams live in `docs/images/`.
 
-Full flashing guide (Chinese): [docs/FLASHING.md](docs/FLASHING.md).
+Full flashing guide (Chinese): [docs/FLASHING.md](docs/FLASHING.md); firmware updates on an already installed device (in-system sysupgrade, U-Boot recovery flashing, BL2+FIP updates and which UBI volumes they touch): [docs/UPGRADE.md](docs/UPGRADE.md).
 
 After installing PonWrt, restore the stock calibration and identity data through U-Boot Web or **Network → PON → Configuration → PON board data** in LuCI. Convert FiberHome `factory` backups with [FiberHome Factory](https://github.com/pbs05/fiberhome-factory) first. Restore converted FiberHome data, `reservearea`, or `dsd` backups to the PonWrt `factory` volume. Nokia `bosa` and `ri` backups use volumes with the same names.
