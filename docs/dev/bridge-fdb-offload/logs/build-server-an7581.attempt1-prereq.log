@@ -1,0 +1,26 @@
+make[2]: Entering directory '/home/debian/ponwrt/scripts/config'
+make[2]: 'conf' is up to date.
+make[2]: Leaving directory '/home/debian/ponwrt/scripts/config'
+Checking 'python3-dev'... ok.
+Checking 'python3-setuptools'... failed.
+Checking 'swig'... ok.
+
+u-boot: Please install the Python3 setuptools module
+
+make[3]: *** [/home/debian/ponwrt/include/prereq.mk:9: prereq] Error 1
+Package prerequisite check failed.
+make[2]: *** [Makefile:86: tmp/.prereq_packages] Error 1
+make[2]: *** Waiting for unfinished jobs....
+make[4]: Entering directory '/home/debian/ponwrt/target/linux'
+make[5]: Entering directory '/home/debian/ponwrt/target/linux/airoha'
+make[6]: Entering directory '/home/debian/ponwrt/target/linux/airoha/image'
+make[6]: Leaving directory '/home/debian/ponwrt/target/linux/airoha/image'
+make[5]: Leaving directory '/home/debian/ponwrt/target/linux/airoha'
+make[4]: Leaving directory '/home/debian/ponwrt/target/linux'
+time: target/linux/prereq#0.42#0.08#0.48
+make[1]: *** [/home/debian/ponwrt/include/toplevel.mk:240: prereq] Error 2
+make: *** [/home/debian/ponwrt/include/toplevel.mk:266: world] Error 2
+MAKE_EXIT=2
+BUILD_DONE_EXIT=2
+WALL_SECONDS=11
+BUILD_END_UTC=2026-10-07 03:09:32
