@@ -13,6 +13,9 @@
 # 脚本只做「加法」：
 #   * 运营商侧已有的 bridge-vlan（例如 OLT 带 tag 3114、2.5G 口剥 tag）原样保留；
 #   * 只有在运营商桥还没做 VLAN 过滤时，才补一条 untagged 透传条目（--isp-vid）。
+#   * 光猫还在出厂状态（wan 直接挂在 pon 上、没有独立运营商桥）时，脚本会把 pon 并进
+#     管理桥，并把 wan 接口改成挂桥上的无协议接口、删除 wan6（等效第 6 节 ②③），
+#     避免 pon 同时被接口和桥占用。
 #
 # 下游路由器侧（示例见 docs/FLASHING.md 6.7.2）：
 #     WAN 口上建 VLAN <VID> 子接口，静态 192.168.1.2/24，
@@ -51,6 +54,7 @@ CONFIG_DIR="${CONFIG_DIR:-/etc/config}"
 BACKUP_DIR="${BACKUP_DIR:-/root}"
 KEEP_MARK="${KEEP_MARK:-/tmp/single-wire-keep}"
 STATE="${STATE:-$BACKUP_DIR/single-wire.state}"
+TIMER_PID_FILE="${TIMER_PID_FILE:-/tmp/single-wire-timer.pid}"
 NETWORK_INIT="${NETWORK_INIT:-/etc/init.d/network}"
 FIREWALL_INIT="${FIREWALL_INIT:-/etc/init.d/firewall}"
 uci() { command uci -c "$CONFIG_DIR" "$@"; }
@@ -71,10 +75,17 @@ while [ $# -gt 0 ]; do
 		--status)  ACTION=status; shift ;;
 		--dry-run) DRY=1; shift ;;
 		--force)   FORCE=1; shift ;;
-		-h|--help) sed -n '2,45p' "$0"; exit 0 ;;
+		-h|--help) awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit 0 ;;
 		*) die "未知参数 $1（--help 查看用法）" ;;
 	esac
 done
+
+case "$VID" in ''|*[!0-9]*) die "--vid 需要 1..4094 之间的数字" ;; esac
+[ "$VID" -ge 1 ] && [ "$VID" -le 4094 ] || die "--vid 超出范围（1..4094）"
+case "$ISP_VID" in ''|*[!0-9]*) die "--isp-vid 需要 1..4094 之间的数字" ;; esac
+[ "$ISP_VID" -ge 1 ] && [ "$ISP_VID" -le 4094 ] || die "--isp-vid 超出范围（1..4094）"
+case "$TIMEOUT" in ''|*[!0-9]*) die "--timeout 需要 1 以上的秒数" ;; esac
+[ "$TIMEOUT" -ge 1 ] || die "--timeout 需要 1 以上的秒数"
 
 # ---------- 工具函数 ----------
 dev_section() {   # $1 = uci 设备名 -> 段名（@device[0] / 命名段）
@@ -98,6 +109,7 @@ do_revert() {
 	[ -f "$STATE" ] || die "没有记录备份路径（$STATE），无法回滚"
 	. "$STATE"
 	[ -f "$BACKUP" ] || die "备份文件不存在: $BACKUP"
+	kill_timer
 	cp "$BACKUP" "$CONFIG_DIR/network"
 	rm -f "$KEEP_MARK"
 	"$NETWORK_INIT" reload
@@ -106,6 +118,13 @@ do_revert() {
 }
 
 write_state() { printf 'BACKUP=%s\n' "$1" > "$STATE"; }
+
+kill_timer() {   # 杀掉挂起的自动回滚定时器（避免 revert/重复 apply 后旧定时器再触发）
+	if [ -f "$TIMER_PID_FILE" ]; then
+		kill "$(cat "$TIMER_PID_FILE" 2>/dev/null)" 2>/dev/null || true
+		rm -f "$TIMER_PID_FILE"
+	fi
+}
 
 # ---------- 找到管理接口 / 它所在的桥 ----------
 find_lan_iface() {   # 优先名为 lan 的接口，其次找挂在 br-* 上的接口
@@ -149,6 +168,7 @@ fi
 
 if [ "$ACTION" = "keep" ]; then
 	touch "$KEEP_MARK"
+	kill_timer
 	msg "已标记保留当前配置，自动回滚不会再执行"
 	exit 0
 fi
@@ -196,10 +216,24 @@ else
 	case "$PON" in pon*) ;; *) PON="pon0" ;; esac
 	[ -n "$PORT25" ] || die "没有独立的运营商桥，请用 --2.5g <2.5G口名> 指定（先 ip -br link 确认）"
 	NEED_ISP_VLAN=1
+	# 出厂状态 wan 直接占着 pon：并桥后改成挂桥上的无协议接口，否则 netifd 报 device in use
+	FIX_WAN=0
+	if [ "$(uci -q get network.wan.device 2>/dev/null || true)" = "$PON" ]; then
+		FIX_WAN=1
+	fi
 fi
 [ -n "${PON:-}" ] || PON="pon0"
 [ -n "${UPNAME:-}" ] || UPNAME="br-lan"
 [ -n "${PORT25:-}" ] || die "推断不出 2.5G 口，请用 --2.5g <口名> 指定"
+
+# 2.5G 口必须是目标桥的成员（bridge-vlan 引用非成员口时内核会静默忽略，配了也不生效）
+case " $(dev_ports "$UPBR") " in
+	*" $PORT25 "*) ;;
+	*) die "$PORT25 不在桥 $UPNAME 的端口列表里，请用 --2.5g 指定实际的桥成员口" ;;
+esac
+if [ "$NEED_ISP_VLAN" = "1" ] && [ "$VID" = "$ISP_VID" ]; then
+	die "管理 VLAN 与运营商 VLAN 都是 $VID，请用 --vid/--isp-vid 错开"
+fi
 
 # 管理 VLAN 是否已被占用
 if uci show network | grep -q "@bridge-vlan\[[0-9]*\]\.vlan='$VID'"; then
@@ -231,7 +265,7 @@ MGMT_PORTS="$(echo $MGMT_PORTS)"
 [ -n "$MGMT_PORTS" ] || msg "警告：桥里没有千兆口，管理网只会走 2.5G 口"
 
 echo "--- 当前 ---"
-echo "br-lan 桥      : $UPNAME（段 $LAND，端口 $(dev_ports "$LAND")）"
+echo "br-lan 桥      : $(dev_name "$LAND")（段 $LAND，端口 $(dev_ports "$LAND")）"
 [ "$LAND" != "$UPBR" ] && echo "运营商桥       : $UPNAME（段 $UPBR，端口 $CUR_UP_PORTS）"
 echo "PON 设备       : $PON"
 echo "2.5G 口        : $PORT25"
@@ -246,6 +280,7 @@ fi
 printf '* 新增 bridge-vlan %s（管理网）：%s:t%s\n' "$VID" "$PORT25" "$(for p in $MGMT_PORTS; do printf ' %s:u*' "$p"; done)"
 echo "* 新增 VLAN 子接口 ${UPNAME}.$VID，接口 $LAN_IF 的 device 改成它（地址不变）"
 if [ "$LAND" != "$UPBR" ]; then echo "* 删除多余的桥设备段 $LAND"; fi
+[ "${FIX_WAN:-0}" = "1" ] && echo "* wan 接口改为挂到 $UPNAME、proto=none（wan6 删除），不再直接占用 $PON"
 echo "--------------"
 
 if [ "$DRY" = "1" ]; then
@@ -263,14 +298,20 @@ write_state "$BACKUP"
 msg "已备份 $CONFIG_DIR/network -> $BACKUP"
 
 rm -f "$KEEP_MARK"
+kill_timer
 (
 	sleep "$TIMEOUT"
-	[ -f "$KEEP_MARK" ] && exit 0
+	if [ -f "$KEEP_MARK" ]; then
+		rm -f "$TIMER_PID_FILE"
+		exit 0
+	fi
 	cp "$BACKUP" "$CONFIG_DIR/network"
 	"$NETWORK_INIT" reload
 	"$FIREWALL_INIT" reload
+	rm -f "$TIMER_PID_FILE" "$KEEP_MARK"
 	logger -t single-wire "未在 ${TIMEOUT}s 内确认，已自动回滚网络配置"
 ) </dev/null >/dev/null 2>&1 &
+echo $! > "$TIMER_PID_FILE"
 msg "已启动自动回滚：${TIMEOUT}s 内执行 '$0 --keep' 确认，否则恢复原配置"
 
 # ---------- 应用 ----------
@@ -307,6 +348,13 @@ uci set "network.$LAN_IF.device=$UPNAME.$VID"
 # 原来那个只放千兆口的桥不再需要
 if [ "$LAND" != "$UPBR" ]; then
 	uci_del "network.$LAND"
+fi
+
+# 出厂状态并桥时，wan 不再直接占 pon（等效 FLASHING 6.2 ③）
+if [ "${FIX_WAN:-0}" = "1" ]; then
+	uci set "network.wan.device=$UPNAME"
+	uci set network.wan.proto='none'
+	uci_del network.wan6
 fi
 
 uci commit network

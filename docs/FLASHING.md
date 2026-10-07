@@ -249,6 +249,11 @@ tcpdump -i pon0 -n -e 'pppoed or pppoes'
 路由器在光猫网段里的地址（`192.168.1.2`），光猫直接回给路由器就够了。路由器**自己**访问
 `192.168.1.1` 用的是接口地址，不依赖 NAT。
 
+> **注意**：路由器自己的 LAN 网段**不能也是 `192.168.1.0/24`**。否则 LAN 桥与管理接口
+> 同网段，内核的两条连接路由会产生歧义（`ping 192.168.1.1` 可能从 LAN 桥发出而不走管理
+> 接口），masquerade 也救不回来。冲突时先把路由器 LAN 改成别的网段（如 `10.0.0.1/24`、
+> `192.168.8.1/24`）再套用本节。
+
 #### 6.7.1 方案 A：单独一根管理网线
 
 以「光猫 `lan4` ↔ 路由器 `lan2`、路由器 LAN 为 `10.0.0.1/24`」为例：
@@ -328,7 +333,12 @@ PPPoE 完全不受影响；光猫的管理网打成 VLAN tag 走同一根网线�
   （例如 OLT 侧带 tag `3114`、2.5G 口剥 tag 给下游拨号），脚本只做加法，不会动它；
   若运营商桥还没开 VLAN 过滤，脚本会补一条 untagged 透传条目（`--isp-vid`，默认 2）；
 - 新增管理 VLAN：2.5G 口带 tag、千兆口不带 tag（所以**插在千兆口上的电脑行为完全不变**）；
-- 管理 IP 从原来的桥挪到新桥的 VLAN 子接口（如 `br-wan.2100`）上，地址不变。
+- 管理 IP 从原来的桥挪到新桥的 VLAN 子接口（如 `br-wan.2100`）上，地址不变；
+- 若光猫还在**出厂状态**（`wan` 接口还直接挂在 `pon0` 上、没建独立运营商桥），脚本会把
+  `pon0` 并进管理桥，并把 `wan` 接口改成挂桥上的无协议接口、删除 `wan6`（等效 6.2 的
+  ②③）——不这么做 `pon0` 会被接口和桥同时占用，netifd 报 device in use。此路径生成的
+  管理子接口叫 `br-lan.<VID>`；更稳妥的做法仍是先按第 6 节建好 `br-wan` 再跑脚本，
+  结果与上文示例一致。
 
 以 FiberHome HG5382A（OLT 带 tag 3114，2.5G 口负责剥 tag 给下游 PPPoE）为例，脚本跑完后
 `/etc/config/network` 里是这样：
@@ -442,7 +452,7 @@ nft list chain inet fw4 srcnat | grep 2100   # 会跳转到 srcnat_modem
 ```
 
 光猫侧可以确认 VLAN 归属（`bridge` 命令随 iproute2 一起装，没有该命令时看
-`ip -br addr show br-lan.2100` 有没有地址即可）：
+`ip -br addr show br-wan.2100` 有没有地址即可，桥名以脚本输出的实际名称为准）：
 
 ```sh
 bridge vlan show               # 2.5G 口应同时有 untagged 的 VLAN 2 和 tagged 的 VLAN 2100
@@ -465,7 +475,7 @@ nft list chain inet fw4 srcnat_modem
 ```
 
 方案 B 里如果路由器自己能通、下游设备不通，多半是 masquerade 或 `lan → modem` 转发没
-生效；如果两边都不通，先在光猫上确认 `br-lan.2100` 有地址、2.5G 口是 UP，再确认两端
+生效；如果两边都不通，先在光猫上确认 `br-wan.2100` 有地址、2.5G 口是 UP，再确认两端
 VLAN 号一致（`uci show network | grep bridge-vlan`）。
 
 方案 A 里 `carrier` 为 `0` 时先查网线两端，再回光猫确认那个口还在 `br-lan` 里：
