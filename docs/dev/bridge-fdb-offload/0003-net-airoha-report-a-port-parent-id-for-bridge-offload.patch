@@ -1,0 +1,122 @@
+From: Kitsune <km2077@foxmail.com>
+Subject: [PATCH] net: airoha: report a port parent id for bridge offload
+
+The bridge only assigns a switchdev hardware domain to a port that reports a
+port parent id: br_switchdev_port_offload() calls
+netif_get_port_parent_id() before nbp_switchdev_add(), so a port without one
+gets no hwdom, the bridge never replays its forwarding database to the driver
+and nbp_switchdev_allowed_egress() never masks the frames the hardware has
+already forwarded, which can duplicate them in the software bridge.
+
+All the GMAC netdevs of one controller share the same PPE, so they belong to
+one hardware forwarding domain and have to report the same id. Use the name
+of the ethernet platform device as the per-controller part: it contains the
+unit address of the controller ("1e660000.ethernet" on the AN7581), so it is
+unique between controllers on the same system, stable for the lifetime of the
+device and needs no extra hardware register or devlink instance, the same
+role base_mac plays for sparx5 and lan966x.
+
+The id is built once in airoha_probe() and the port parent id is only read
+there after, so there is no change for a port that is not in a bridge.
+
+Signed-off-by: Kitsune <km2077@foxmail.com>
+---
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 303e92e..bfed2a5 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -4079,9 +4079,39 @@ static const struct net_device_ops airoha_netdev_ops = {
+ 	.ndo_start_xmit		= airoha_dev_xmit,
+ 	.ndo_get_stats64        = airoha_dev_get_stats64,
+ 	.ndo_set_mac_address	= airoha_dev_set_macaddr,
++	.ndo_get_port_parent_id	= airoha_get_port_parent_id,
+ 	.ndo_setup_tc		= airoha_dev_tc_setup,
+ };
+ 
++/* Port parent id, called by the bridge through netif_get_port_parent_id()
++ * when a GMAC netdev joins or leaves a bridge port, see
++ * br_switchdev_port_offload(). All the GMAC netdevs of one controller share
++ * the same PPE, so they belong to a single hardware forwarding domain and
++ * must report the same id: the bridge assigns one hwdom per id and only
++ * replays its FDB to ports that have one.
++ *
++ * The name of the ethernet platform device is used as the per-controller
++ * part of the id. It carries the unit address of the controller in the SoC
++ * address space, so it is unique between controllers on the same system and
++ * stable for the lifetime of the device. airoha_probe() has already
++ * rejected the device if the id did not fit.
++ */
++static int airoha_get_port_parent_id(struct net_device *netdev,
++				     struct netdev_phys_item_id *ppid)
++{
++	const struct airoha_eth *eth = netdev_priv(netdev)->eth;
++
++	BUILD_BUG_ON(AIROHA_SWITCH_ID_LEN > MAX_PHYS_ITEM_ID_LEN);
++
++	if (!eth->switch_id_len)
++		return -EOPNOTSUPP;
++
++	ppid->id_len = eth->switch_id_len;
++	memcpy(ppid->id, eth->switch_id, eth->switch_id_len);
++
++	return 0;
++}
++
+ /* Bridge port offload.
+  *
+  * The airoha netdev is the bridge port itself (the GDM netdevs are members
+@@ -4856,6 +4886,18 @@ static int airoha_probe(struct platform_device *pdev)
+ 
+ 	eth->dev = &pdev->dev;
+ 
++	/* Publish the port parent id of this controller to the bridge. Every
++	 * GMAC netdev reports the same id, see airoha_get_port_parent_id().
++	 */
++	err = snprintf(eth->switch_id, sizeof(eth->switch_id), "%s:%s",
++		       AIROHA_SWITCH_ID_PREFIX, dev_name(eth->dev));
++	if (err >= sizeof(eth->switch_id)) {
++		dev_warn(eth->dev, "switch id for %s does not fit\n",
++			 dev_name(eth->dev));
++		return -ENAMETOOLONG;
++	}
++	eth->switch_id_len = err + 1;
++
+ 	err = dma_set_mask_and_coherent(eth->dev, DMA_BIT_MASK(32));
+ 	if (err) {
+ 		dev_err(eth->dev, "failed configuring DMA mask\n");
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index 0cf3e4d..cd94f16 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -749,6 +749,16 @@ struct airoha_gdm_port {
+ #define AIROHA_RXD4_PPE_CPU_REASON	GENMASK(20, 16)
+ #define AIROHA_RXD4_FOE_ENTRY		GENMASK(15, 0)
+ 
++/* Port parent id ("switch id") reported for every GMAC netdev of one
++ * controller, see airoha_get_port_parent_id(). The bridge only compares it
++ * byte for byte to decide whether two ports belong to the same hardware
++ * forwarding domain, so its layout is free. The buffer holds the
++ * "airoha" namespace prefix, the name of the ethernet platform device
++ * ("1e660000.ethernet" on the AN7581) and the NUL terminator.
++ */
++#define AIROHA_SWITCH_ID_PREFIX		"airoha"
++#define AIROHA_SWITCH_ID_LEN		24
++
+ struct airoha_ppe {
+ 	struct airoha_ppe_dev dev;
+ 	struct airoha_eth *eth;
+@@ -796,6 +806,13 @@ struct airoha_eth {
+ 
+ 	const struct airoha_eth_soc_data *soc;
+ 
++	/* Port parent id ("switch id" in switchdev terms) reported by every
++	 * GMAC netdev belonging to this controller, see
++	 * airoha_get_port_parent_id(). Assigned once in airoha_probe().
++	 */
++	u8 switch_id[AIROHA_SWITCH_ID_LEN];
++	u8 switch_id_len;
++
+ 	unsigned long state;
+ 	void __iomem *fe_regs;
+ 

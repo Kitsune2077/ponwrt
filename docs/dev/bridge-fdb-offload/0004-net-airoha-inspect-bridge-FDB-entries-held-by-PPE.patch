@@ -1,0 +1,207 @@
+From: Kitsune <km2077@foxmail.com>
+Subject: [PATCH] net: airoha: inspect the bridge FDB entries held by the PPE
+
+A bridge FDB entry learned by the software bridge is deleted after the bridge
+ageing time (300 s by default) unless something refreshes it, see
+br_fdb_cleanup(). An entry the PPE forwards never reaches the bridge, so
+f->updated is never bumped, the entry is deleted, the PPE entry promoted from
+it is torn down by airoha_ppe_bridge_fdb_update() and traffic falls back to
+the software bridge until the destination is relearned.
+
+Refreshing the entry from the driver is not possible in this kernel, so this
+does not pretend to fix it: the bridge only handles
+SWITCHDEV_FDB_ADD_TO_BRIDGE for a port that is offloaded, and no notifier in
+the tree consumes that event, while switchdev_fdb_notify(), which used to
+generate it, does not exist here. See the README in
+docs/dev/bridge-fdb-offload/ for the full analysis.
+
+Instead, add an opt-in work item that walks the bridge FDB table added for the
+PPE offload and counts the entries whose promoted PPE entry is still bound and
+was used less than the inspection period ago, i.e. the entries the bridge is
+about to age out while the hardware is still forwarding them. It logs a
+rate-limited line per run and needs no hardware access of its own: the PPE
+idle time is read through the existing airoha_ppe_entry_idle_time() helper,
+which re-validates the entry under ppe_lock.
+
+The period is the fdb_refresh_period module parameter and defaults to 0, which
+disables the work item: this is an inspection aid, and enabling it only adds
+periodic log output.
+
+Signed-off-by: Kitsune <km2077@foxmail.com>
+---
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index cd94f16..04d0961 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -779,6 +779,12 @@ struct airoha_ppe {
+ 		unsigned long tagged;   /* tagged frame, left to the bridge */
+ 	} fdb_stats;
+ 
++	/* Inspects the bridge FDB entries offloaded to the PPE, see
++	 * airoha_ppe_fdb_refresh_work(). Only started when the
++	 * fdb_refresh_period module parameter is not 0.
++	 */
++	struct delayed_work fdb_refresh_work;
++
+ 	struct hlist_head *foe_flow;
+ 	u16 *foe_check_time;
+ 
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index 358973a..40c3732 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -45,6 +45,17 @@ static const struct rhashtable_params airoha_fdb_table_params = {
+ 	.automatic_shrinking = true,
+ };
+ 
++/* How often airoha_ppe_fdb_refresh_work() looks at the FDB entries that are
++ * forwarded by the PPE, in seconds. 0 (the default) disables the worker.
++ * This is an inspection aid only: the driver cannot refresh a bridge FDB
++ * entry yet (see the README next to this patch), so enabling this must not
++ * be sold as a working workaround for bridge ageing.
++ */
++static uint fdb_refresh_period;
++module_param(fdb_refresh_period, uint, 0644);
++MODULE_PARM_DESC(fdb_refresh_period,
++		 "Inspect the offloaded bridge FDB entries every N seconds (0 = off)");
++
+ static int airoha_ppe_get_num_stats_entries(struct airoha_ppe *ppe)
+ {
+ 	if (!IS_ENABLED(CONFIG_NET_AIROHA_FLOW_STATS))
+@@ -1570,6 +1581,113 @@ static int airoha_ppe_entry_idle_time(struct airoha_ppe *ppe,
+ 	return airoha_ppe_get_entry_idle_time(ppe, e->data.ib1);
+ }
+ 
++/* True when at least one PPE entry promoted from @fdb has been used less
++ * than fdb_refresh_period seconds ago, i.e. when the hardware is really
++ * forwarding this destination.
++ *
++ * NOTE: the actual refresh of the bridge entry is not implemented. A bridge
++ * FDB entry that only exists because the software bridge learned it is
++ * deleted after the bridge ageing time (300 s by default) unless it is
++ * refreshed, see br_fdb_cleanup(): entries forwarded by the PPE never reach
++ * the bridge, so f->updated is never bumped, the entry is deleted, the FOE
++ * promoted from it is torn down by airoha_ppe_bridge_fdb_update() and
++ * traffic falls back to the software bridge until it is relearned.
++ *
++ * There is no driver-callable way to refresh the entry in this kernel:
++ *  - SWITCHDEV_FDB_ADD_TO_BRIDGE is the event a driver sends to the bridge
++ *    for an entry it learned itself (prestera is the only sender in tree),
++ *    but in this kernel no bridge/vxlan notifier handles it, so it would
++ *    only stop the ageing timer if the bridge grew a consumer for it;
++ *  - switchdev_fdb_notify()/switchdev_fdb_notify_struct(), which used to
++ *    build such an event, do not exist in this kernel;
++ *  - the only other switchdev FDB event that reaches the bridge is
++ *    SWITCHDEV_FDB_OFFLOADED, and br_switchdev_event() ignores it
++ *    (BR_FDB_OFFLOADED is bookkeeping, it does not stop the ageing timer).
++ *
++ * TODO(bridge refresh): once the bridge has a way to refresh a non-static
++ * entry from a switchdev notification, send it for every entry counted here.
++ */
++static bool airoha_ppe_fdb_entry_is_active(struct airoha_ppe *ppe,
++					   struct airoha_fdb_entry *fdb)
++{
++	struct airoha_flow_table_entry *e;
++
++	/* The PPE timestamps its entries in seconds, see
++	 * airoha_ppe_get_entry_idle_time().
++	 */
++	if (list_empty(&fdb->flows))
++		return false;
++
++	list_for_each_entry(e, &fdb->flows, fdb_node) {
++		if (airoha_ppe_entry_idle_time(ppe, e) < fdb_refresh_period)
++			return true;
++	}
++
++	return false;
++}
++
++static void airoha_ppe_fdb_refresh_work(struct work_struct *work)
++{
++	struct airoha_ppe *ppe = container_of(work, struct airoha_ppe,
++					      fdb_refresh_work.work);
++	struct rhashtable_iter iter;
++	struct airoha_fdb_entry *fdb;
++	unsigned long active = 0, offloaded = 0;
++	bool printed = false, complete = true;
++
++	/* The walk can sleep, so it cannot run from airoha_ppe_check_skb()
++	 * and it does not: this is a work item on system_wq.
++	 *
++	 * The table can be rehashed while this runs, because FDB events arrive
++	 * from softirq. rhashtable_walk_next() then returns ERR_PTR(-EAGAIN)
++	 * and moves the iterator to the new table, i.e. it would count the
++	 * entries seen so far a second time, so the pass is abandoned instead
++	 * and the next one covers the whole table.
++	 */
++	rhashtable_walk_enter(&ppe->fdb_table, &iter);
++	rhashtable_walk_start(&iter);
++
++	while ((fdb = rhashtable_walk_next(&iter))) {
++		if (IS_ERR(fdb)) {
++			complete = false;
++			break;
++		}
++
++		offloaded++;
++		if (!airoha_ppe_fdb_entry_is_active(ppe, fdb))
++			continue;
++
++		active++;
++		if (!printed) {
++			dev_info_ratelimited(ppe->eth->dev,
++					     "%s: bridge entry %pM vid %u is offloaded and in use\n",
++					     fdb->egress->name, fdb->key.addr,
++					     fdb->key.vid);
++			printed = true;
++		}
++	}
++
++	rhashtable_walk_stop(&iter);
++	rhashtable_walk_exit(&iter);
++
++	if (!complete)
++		dev_info(ppe->eth->dev,
++			 "bridge FDB table changed during the scan, retrying next period\n");
++	else if (active)
++		dev_info(ppe->eth->dev,
++			 "%lu of %lu offloaded bridge entries are in use, no refresh available\n",
++			 active, offloaded);
++
++	/* Run again only when the inspection is enabled: mod_delayed_work()
++	 * is used so that a 0 written to the module parameter stops the work
++	 * at the end of the current run.
++	 */
++	if (fdb_refresh_period)
++		mod_delayed_work(system_wq, &ppe->fdb_refresh_work,
++				 round_jiffies(msecs_to_jiffies(
++					 (unsigned long)fdb_refresh_period * 1000)));
++}
++
+ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 					   struct flow_cls_offload *f)
+ {
+@@ -2170,6 +2288,12 @@ int airoha_ppe_init(struct airoha_eth *eth)
+ 	if (err)
+ 		goto error_fdb_table_destroy;
+ 
++	INIT_DELAYED_WORK(&ppe->fdb_refresh_work, airoha_ppe_fdb_refresh_work);
++	if (fdb_refresh_period)
++		mod_delayed_work(system_wq, &ppe->fdb_refresh_work,
++				 round_jiffies(msecs_to_jiffies(
++					 (unsigned long)fdb_refresh_period * 1000)));
++
+ 	return 0;
+ 
+ error_fdb_table_destroy:
+@@ -2186,6 +2310,8 @@ void airoha_ppe_deinit(struct airoha_eth *eth)
+ {
+ 	struct airoha_npu *npu;
+ 
++	cancel_delayed_work_sync(&eth->ppe->fdb_refresh_work);
++
+ 	mutex_lock(&flow_offload_mutex);
+ 
+ 	npu = rcu_replace_pointer(eth->npu, NULL,

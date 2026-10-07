@@ -11,20 +11,22 @@ broadcast on the global switchdev notifier chain, while the per-port
 notifier blocks passed to switchdev_bridge_port_offload() are only used by
 the bridge to replay its state, so both are registered for the same blocks.
 
-The offload is best effort: switchdev_bridge_port_offload() currently fails
-with -EOPNOTSUPP because the netdev has no port parent id (no devlink switch
-port and no ndo_get_port_parent_id), and the bridge join must not fail for
-that. FDB events keep arriving on the global chain, so the forwarding
-database is still tracked and bridged flows are still offloaded.
+The offload is best effort: the bridge join must never fail because of the
+offload, so errors from switchdev_bridge_port_offload() are logged and
+ignored. The bridge only assigns a hardware domain to a port that reports a
+port parent id (which also enables the FDB replay at join and the
+forwarded-mark masking); that is added by the follow-up patch.
 
 Signed-off-by: Kitsune <km2077@foxmail.com>
 ---
 --- a/drivers/net/ethernet/airoha/airoha_eth.c
 +++ b/drivers/net/ethernet/airoha/airoha_eth.c
-@@ -16,6 +16,7 @@
+@@ -16,8 +16,9 @@
  #include <net/dst_metadata.h>
+ #include <net/ip6_checksum.h>
  #include <net/page_pool/helpers.h>
  #include <net/pkt_cls.h>
+ #include <net/tcp.h>
 +#include <net/switchdev.h>
  #include <uapi/linux/ppp_defs.h>
  
