@@ -222,6 +222,7 @@ tcpdump -i pon0 -n -e 'pppoed or pppoes'
 - **不要**把 `pon0` 桥进 `br-lan`：运营商的二层网络会和局域网混在一起，光猫的 DHCP
   服务器还会与运营商侧 DHCP 冲突；
 - 桥接后光猫的管理地址只保留在 `br-lan` 的其它网口上，别把 2.5G 口留在里面；
+  想让下游路由器及其下面的设备也能打开管理页，见 6.7；
 - `pon0` 与 2.5G 口是两个独立 GMAC，L2 转发由内核桥处理；PonWrt 默认开启 flow offload
   （`flow_offloading` 与 `flow_offloading_hw`，并额外生成 bridge 家族的 flowtable，端口
   覆盖 `pon0`/`lan1`），桥接流量有机会被卸载到 NPU/PPE。可用 `nft list flowtables` 确认
@@ -230,6 +231,282 @@ tcpdump -i pon0 -n -e 'pppoed or pppoes'
   （但不要执行 U-Boot 恢复页的"重建 UBI"；三条固件更新路径见 [UPGRADE.md](UPGRADE.md)）。
 - 另外**不要把 `lan2`/`lan3`/`lan4` 全部移出 `br-lan`**：U-Boot 阶段只启用内部交换机
   `gdm1`（就是这三个千兆口），全摘掉之后系统起不来时就没有网口能访问 `192.168.0.1` 了。
+
+### 6.7 从下游路由器访问光猫管理页（`192.168.1.1`）
+
+按第 6 节把 2.5G 口桥给下游路由器拨号之后，光猫自己的管理地址 `192.168.1.1` 只存在于
+`br-lan` 上，下游路由器（下称「路由器」）的 WAN 口是 PPPoE，走不到这个地址。要让它对
+**路由器本身**和**路由器后面的设备**都可见，有两种做法：
+
+| 方案 | 需要的网线 | 光猫侧改动 | 适用场景 |
+| --- | --- | --- | --- |
+| A. 单独管理网线 | 2 根（2.5G 拨号 + 管理口互联） | 无 | 走线方便，改动最小 |
+| B. 单线复用 | 1 根（只有 WAN 那根） | 2.5G 口改成 VLAN 干线 | 不方便再拉线 |
+
+两种方案在路由器侧都是同一套思路：把接光猫的那个口（方案 A）或那条 VLAN（方案 B）配成
+独立接口，放进独立防火墙区并开 masquerade。原因是光猫上只有 `192.168.1.0/24` 的直连
+路由，回 `10.0.0.0/24` 的包会被它丢给默认网关；`masq '1'` 把下游设备的源地址改写成
+路由器在光猫网段里的地址（`192.168.1.2`），光猫直接回给路由器就够了。路由器**自己**访问
+`192.168.1.1` 用的是接口地址，不依赖 NAT。
+
+#### 6.7.1 方案 A：单独一根管理网线
+
+以「光猫 `lan4` ↔ 路由器 `lan2`、路由器 LAN 为 `10.0.0.1/24`」为例：
+
+```
+光猫 br-lan(192.168.1.1) ── lan4 ══ 网线 ══ lan2 ── 路由器（独立接口 192.168.1.2/24
+                        （br-lan 成员）                    + masquerade，lan → modem 放行）
+                                                              └── 下游设备 10.0.0.0/24
+```
+
+**光猫侧**：接路由器的那个口保持在 `br-lan` 里即可，不需要任何额外配置——`br-lan` 所在
+防火墙区默认 `input ACCEPT`，会放行管理页。注意别把这个口桥进 `br-wan`。
+
+**路由器侧**：把这个 LAN 口从路由器的 LAN 桥里摘出来，单独建一个静态接口并开 masquerade：
+
+```sh
+# ① 把接光猫的口从路由器的 LAN 桥里摘掉（这里以 lan2 为例）
+dev=$(uci show network | sed -n "s/^network\.\([^.]*\)\.name='br-lan'$/\1/p" | head -n1)
+uci -q del_list network.$dev.ports='lan2'
+
+# ② 新建管理接口：静态地址放在光猫网段里，但不要网关（默认路由还得走 PPPoE）。
+#    地址要避开光猫的 DHCP 池（PonWrt 默认池从 192.168.1.100 起）
+uci set network.modem=interface
+uci set network.modem.proto='static'
+uci set network.modem.device='lan2'
+uci set network.modem.ipaddr='192.168.1.2'
+uci set network.modem.netmask='255.255.255.0'
+uci set network.modem.defaultroute='0'
+
+# ③ 独立防火墙区并开 masquerade，只放行 lan → modem
+uci add firewall zone
+uci set firewall.@zone[-1].name='modem'
+uci set firewall.@zone[-1].input='REJECT'
+uci set firewall.@zone[-1].output='ACCEPT'
+uci set firewall.@zone[-1].forward='REJECT'
+uci set firewall.@zone[-1].masq='1'
+uci set firewall.@zone[-1].mtu_fix='1'
+uci add_list firewall.@zone[-1].network='modem'
+uci add firewall forwarding
+uci set firewall.@forwarding[-1].src='lan'
+uci set firewall.@forwarding[-1].dest='modem'
+
+uci commit network
+uci commit firewall
+/etc/init.d/network reload
+/etc/init.d/firewall reload
+```
+
+LuCI 等效操作：
+
+1. **网络 → 接口 → 设备**：编辑 `br-lan`，把接光猫的端口从端口列表里移除；
+2. **网络 → 接口 → 添加新接口**：名称 `modem`、协议「静态地址」、设备选那个口，
+   IPv4 地址 `192.168.1.2`、掩码 `255.255.255.0`，**不要**填网关、不要在「高级设置」里
+   勾默认路由；
+3. **网络 → 防火墙**：新增区域 `modem`（入站 `拒绝`、出站 `接受`、转发 `拒绝`，
+   勾选「IP 动态伪装」与「MSS 钳制」），网络选 `modem`；再在「区域转发」里加一条
+   `lan → modem`；
+4. 保存并应用。
+
+#### 6.7.2 方案 B：单线复用（同一根网线同时跑上网和管理）
+
+把 2.5G 口从「纯二层桥」改成「**VLAN 干线**」：运营商流量仍然 untagged 透传，下游
+PPPoE 完全不受影响；光猫的管理网打成 VLAN tag 走同一根网线。
+
+```
+                                     ┌── untagged ──► 运营商二层（WAN 口 PPPoE，不变）
+光猫 2.5G 口 ══ 一根网线 ══ 路由器 ──┤
+                                     └── VLAN 2100 ─► 光猫 br-lan / 192.168.1.1
+                                         (tag)        路由器 eth1.2100 = 192.168.1.2/24 + masq
+```
+
+**光猫侧**：本仓库带了一个脚本 [`docs/scripts/ponwrt-single-wire.sh`](scripts/ponwrt-single-wire.sh)，
+它把管理网加到 2.5G 口上（原理和命令都写在脚本头部注释里，也可以照抄手动执行）：
+
+- 让放 `pon0` 的那个桥打开 `vlan_filtering`，并把千兆口（`lan2`/`lan3`/`lan4`）并进同一个桥；
+- **运营商侧已有的 `bridge-vlan` 原样保留**：如果你的光猫已经按 6.4 做了 tag↔untag
+  （例如 OLT 侧带 tag `3114`、2.5G 口剥 tag 给下游拨号），脚本只做加法，不会动它；
+  若运营商桥还没开 VLAN 过滤，脚本会补一条 untagged 透传条目（`--isp-vid`，默认 2）；
+- 新增管理 VLAN：2.5G 口带 tag、千兆口不带 tag（所以**插在千兆口上的电脑行为完全不变**）；
+- 管理 IP 从原来的桥挪到新桥的 VLAN 子接口（如 `br-wan.2100`）上，地址不变。
+
+以 FiberHome HG5382A（OLT 带 tag 3114，2.5G 口负责剥 tag 给下游 PPPoE）为例，脚本跑完后
+`/etc/config/network` 里是这样：
+
+```
+config device 'brwan'
+	option name 'br-wan'
+	option type 'bridge'
+	option vlan_filtering '1'
+	list ports 'pon0' 'lan1' 'lan2' 'lan3' 'lan4'
+
+config bridge-vlan            # 原有：运营商 tag↔untag，原样保留
+	option device 'br-wan'
+	option vlan '3114'
+	list ports 'pon0:t' 'lan1:u*'
+
+config bridge-vlan            # 新增：管理网
+	option device 'br-wan'
+	option vlan '2100'
+	list ports 'lan1:t' 'lan2:u*' 'lan3:u*' 'lan4:u*'
+
+config device 'singlewire'
+	option name 'br-wan.2100'
+	option type 'vlan'
+	option ifname 'br-wan'
+	option vid '2100'
+
+config interface 'lan'
+	option device 'br-wan.2100'
+	option proto 'static'
+	list ipaddr '192.168.1.1/24'
+```
+
+```sh
+# 在光猫上执行（可以从任意千兆口 SSH 进去；脚本自带回滚保险）
+sh ponwrt-single-wire.sh --dry-run   # 先看要做的改动
+sh ponwrt-single-wire.sh             # 应用，10 分钟内不确认会自动回滚
+sh ponwrt-single-wire.sh --keep      # 确认没问题，保留配置
+sh ponwrt-single-wire.sh --revert    # 出问题立刻回滚
+```
+
+**路由器侧**：WAN 口上建一个 VLAN 2100 子接口，其余与方案 A 相同：
+
+```sh
+# ① WAN 口上的 VLAN 子接口（下面以 eth1 为例，用 ip -br link 确认实际设备名）
+uci set network.modemvlan=device
+uci set network.modemvlan.name='eth1.2100'
+uci set network.modemvlan.type='vlan'
+uci set network.modemvlan.ifname='eth1'
+uci set network.modemvlan.vid='2100'
+
+# ② 管理接口：静态 192.168.1.2/24，不要网关（默认路由还得走 PPPoE）
+uci set network.modem=interface
+uci set network.modem.proto='static'
+uci set network.modem.device='eth1.2100'
+uci set network.modem.ipaddr='192.168.1.2'
+uci set network.modem.netmask='255.255.255.0'
+uci set network.modem.defaultroute='0'
+
+# ③ 独立防火墙区 + masquerade（与方案 A 相同）
+uci add firewall zone
+uci set firewall.@zone[-1].name='modem'
+uci set firewall.@zone[-1].input='REJECT'
+uci set firewall.@zone[-1].output='ACCEPT'
+uci set firewall.@zone[-1].forward='REJECT'
+uci set firewall.@zone[-1].masq='1'
+uci set firewall.@zone[-1].mtu_fix='1'
+uci add_list firewall.@zone[-1].network='modem'
+uci add firewall forwarding
+uci set firewall.@forwarding[-1].src='lan'
+uci set firewall.@forwarding[-1].dest='modem'
+
+uci commit network && uci commit firewall
+/etc/init.d/network reload && /etc/init.d/firewall reload
+```
+
+注意事项：
+
+- 路由器 WAN 口的 PPPoE 仍然在 untagged 的 `eth1` 上，**不要**动 `network.wan`：加一个
+  `eth1.<VID>` 子接口不会影响 PPPoE，即使管理 VLAN 配错了上网也还在；
+- 运营商带 tag 时，先在光猫上按 6.4 配好 tag↔untag（下游 PPPoE 拿到的是 untagged 流量，
+  不用改路由器），再跑脚本；脚本只做加法，已有的 `bridge-vlan` 一律保留。同一根线上还有
+  别的 tagged 业务（IPTV 等）时同理，各自按 6.4 加一条 `bridge-vlan` 即可；
+- 光猫侧 2.5G 口名不一定叫 `lan1`（多数机型是，先用 `ip -br link` 确认）。脚本会从运营
+  商桥的端口里自动推断，推不出来时用 `--2.5g <口名>` 指定；
+- `--vid`（默认 2100）两端必须一致；
+- 单线复用生效后**不要**再把光猫的千兆口和 2.5G 口接进同一个下游二层网络：管理 VLAN 会
+  在两条路径之间形成环，桥默认不开 STP，会变成广播风暴。
+
+#### 6.7.3 验证与排错
+
+方案 A（`lan2`）：
+
+```sh
+ip -br addr show lan2          # 应有 192.168.1.2/24
+ip route | grep 192.168.1      # 192.168.1.0/24 dev lan2 scope link
+ping -c 2 192.168.1.1          # 路由器自己能通
+curl -sI http://192.168.1.1/   # 能取到 LuCI 的响应头
+nft list chain inet fw4 srcnat_modem   # 区域开 masq 后会有这个链
+```
+
+方案 B（`eth1.2100`）：
+
+```sh
+ip -br addr show eth1.2100     # 应有 192.168.1.2/24
+ip route | grep 192.168.1      # 192.168.1.0/24 dev eth1.2100 scope link
+ping -c 2 192.168.1.1          # 路由器自己能通
+curl -sI http://192.168.1.1/   # 能取到 LuCI 的响应头
+ip -br addr show pppoe-wan     # PPPoE 应仍然在线：上网不受影响
+nft list chain inet fw4 srcnat | grep 2100   # 会跳转到 srcnat_modem
+```
+
+光猫侧可以确认 VLAN 归属（`bridge` 命令随 iproute2 一起装，没有该命令时看
+`ip -br addr show br-lan.2100` 有没有地址即可）：
+
+```sh
+bridge vlan show               # 2.5G 口应同时有 untagged 的 VLAN 2 和 tagged 的 VLAN 2100
+ip -br link                    # 2.5G 口与 pon0 都应为 UP
+```
+
+然后在任意下游设备上 `ping 192.168.1.1` / 打开 `http://192.168.1.1/` 应能直接访问。
+`input 'REJECT'` 是有意为之：只允许下游主动访问光猫，不需要让光猫主动连路由器。
+
+排错（按顺序看）：
+
+```sh
+# 方案 A：确认物理链路（0 = 没链路，先查网线两端）
+cat /sys/class/net/lan2/carrier
+
+# 方案 B：确认 VLAN 子接口、路由和 NAT
+ip -br addr show eth1.2100
+ip route show 192.168.1.0/24          # 应是 dev eth1.2100
+nft list chain inet fw4 srcnat_modem
+```
+
+方案 B 里如果路由器自己能通、下游设备不通，多半是 masquerade 或 `lan → modem` 转发没
+生效；如果两边都不通，先在光猫上确认 `br-lan.2100` 有地址、2.5G 口是 UP，再确认两端
+VLAN 号一致（`uci show network | grep bridge-vlan`）。
+
+方案 A 里 `carrier` 为 `0` 时先查网线两端，再回光猫确认那个口还在 `br-lan` 里：
+
+```sh
+# 在光猫上执行
+uci show network | grep -A3 "name='br-lan'"   # ports 里应能看到 lan2/lan3/lan4
+ip -br link                                   # 对应口应为 UP，而不是 DOWN
+```
+
+桥接时若把 `lan2`/`lan3`/`lan4` 一起移出了 `br-lan`，这些口会变成 `DOWN`、对端看不到
+载波，光猫也就**没有任何有线管理入口**了。先换一个还在 `br-lan` 里的口试试；一个都不剩
+时只能走串口控制台（接线见 [UNBRICK.md](UNBRICK.md) 的 USB-TTL 部分）：启动到 Linux 后在
+控制台上登录，把口加回 `br-lan` 即可，不需要重刷固件：
+
+```sh
+# 在光猫的串口控制台上执行（段名以 uci show network 的实际输出为准）
+uci show network | grep "device\["
+uci add_list network.@device[0].ports='lan4'
+uci commit network && /etc/init.d/network reload
+```
+
+另外多数机型 2.5G 口是 `lan1`，但换机型时一定先用 `ip -br link` 确认口名。
+
+不想在路由器上做 NAT 也可以反过来：路由器接口保持 `192.168.1.2/24`，在**光猫**上加一条
+回程路由，下游设备的源地址就可以原样保留：
+
+```sh
+# 在光猫上执行
+uci add network route
+uci set network.@route[-1].interface='lan'
+uci set network.@route[-1].target='10.0.0.0/24'
+uci set network.@route[-1].gateway='192.168.1.2'
+uci commit network && /etc/init.d/network reload
+```
+
+两种做法二选一即可。接口本身不要配 IPv6：`net.ipv6.conf.all.forwarding=1` 时内核本来
+就不会处理对端路由通告，光猫发的 RA 不会抢走默认路由。
+
+这些改动都在路由器自己的 `/etc/config/network`、`/etc/config/firewall` 里，属于
+sysupgrade 保留范围。
 
 ## 7. 救砖
 
