@@ -236,23 +236,27 @@ tcpdump -i pon0 -n -e 'pppoed or pppoes'
 
 按第 6 节把 2.5G 口桥给下游路由器拨号之后，光猫自己的管理地址 `192.168.1.1` 只存在于
 `br-lan` 上，下游路由器（下称「路由器」）的 WAN 口是 PPPoE，走不到这个地址。要让它对
-**路由器本身**和**路由器后面的设备**都可见，有两种做法：
+**路由器本身**和**路由器后面的设备**都可见，有三种做法：
 
 | 方案 | 需要的网线 | 光猫侧改动 | 适用场景 |
 | --- | --- | --- | --- |
 | A. 单独管理网线 | 2 根（2.5G 拨号 + 管理口互联） | 无 | 走线方便，改动最小 |
 | B. 单线复用 | 1 根（只有 WAN 那根） | 2.5G 口改成 VLAN 干线 | 不方便再拉线 |
+| C. 单线并存 + 插件 | 1 根（只有 WAN 那根） | `br-wan` 加一个管理 IP（不动桥） | 不方便再拉线、路由器装有 iStore，想省掉路由器侧手工配置（6.7.4） |
 
-两种方案在路由器侧都是同一套思路：把接光猫的那个口（方案 A）或那条 VLAN（方案 B）配成
+方案 A/B 在路由器侧是同一套思路：把接光猫的那个口（方案 A）或那条 VLAN（方案 B）配成
 独立接口，放进独立防火墙区并开 masquerade。原因是光猫上只有 `192.168.1.0/24` 的直连
 路由，回 `10.0.0.0/24` 的包会被它丢给默认网关；`masq '1'` 把下游设备的源地址改写成
 路由器在光猫网段里的地址（`192.168.1.2`），光猫直接回给路由器就够了。路由器**自己**访问
-`192.168.1.1` 用的是接口地址，不依赖 NAT。
+`192.168.1.1` 用的是接口地址，不依赖 NAT。方案 C 把路由器侧整个交给 `luci-app-ap-modem`
+插件（管理地址需换一个网段），见 6.7.4。
 
-> **注意**：路由器自己的 LAN 网段**不能也是 `192.168.1.0/24`**。否则 LAN 桥与管理接口
+> **注意（方案 A/B）**：路由器自己的 LAN 网段**不能也是 `192.168.1.0/24`**。否则 LAN 桥与管理接口
 > 同网段，内核的两条连接路由会产生歧义（`ping 192.168.1.1` 可能从 LAN 桥发出而不走管理
 > 接口），masquerade 也救不回来。冲突时先把路由器 LAN 改成别的网段（如 `10.0.0.1/24`、
-> `192.168.8.1/24`）再套用本节。
+> `192.168.8.1/24`）再套用本节。方案 C 不受此限——它路由器侧走独立网段（下文以
+> `192.168.9.0/24` 为例），LAN 与 `192.168.1.0/24` 同网段也不冲突，只是同样不能与管理
+> 网段撞车。
 
 #### 6.7.1 方案 A：单独一根管理网线
 
@@ -517,6 +521,139 @@ uci commit network && /etc/init.d/network reload
 
 这些改动都在路由器自己的 `/etc/config/network`、`/etc/config/firewall` 里，属于
 sysupgrade 保留范围。
+
+#### 6.7.4 方案 C：单线并存 + `luci-app-ap-modem` 插件（路由器侧免配置）
+
+[iStore 仓库](https://github.com/linkease/openwrt-app-actions/tree/main/applications/luci-app-ap-modem)
+的 `luci-app-ap-modem`（jjm2473 作）解决的是另一类问题：目标网段在链路上**已经 untagged
+可达**，只是路由器没有通往它的路由和 NAT。它只在路由器 WAN 网卡上再挂一个静态 IP（放进
+现有 `wan` 区蹭 masquerade），**不解 VLAN tag、不碰 `network.wan`**——PPPoE 帧是独立的
+ethertype，与网卡上的 IP 天然并存，拨号完全不受影响。
+
+按第 6 节桥接后 `br-wan` 是纯二层桥、没有 IP，那根线上只有运营商二层，插件的前提并不
+成立，所以光猫侧仍要做一个**比方案 B 小得多的改动**：给 `br-wan` 加一个管理 IP，让管理
+网以 untagged 形式与 PPPoE 同线并存。网段必须换新的（下文以 `192.168.9.0/24` 为例）：
+`br-lan` 已占用 `192.168.1.0/24`，光猫上两个接口同网段会产生路由歧义（道理同上文对
+路由器 LAN 的警告）。
+
+```
+                     ┌── untagged PPPoE ──► 运营商二层（不变）
+光猫 br-wan ◄══ 一根网线 ══► 路由器 eth1
+   └─ 新增管理 IP 192.168.9.1       ├─ pppoe-wan：照常拨号（插件不碰）
+      （与 PPPoE 同线 untagged 并存） └─ 插件建的 vap_wan = 192.168.9.254（蹭 wan 区 masq）
+```
+
+**光猫侧**（SSH 进光猫执行；桥名不是 `br-wan` 时按 `uci show network` 的实际输出改）。
+先用 `uci show network | grep bridge-vlan` 判断：按 6.4 做过 tag↔untag（如 OLT tag
+3114）走情况 ②，没做过走情况 ①。
+
+情况 ①（运营商流量 untagged、桥未开 VLAN 过滤）：管理 IP 直接挂桥上：
+
+```sh
+uci set network.mgmtwan=interface
+uci set network.mgmtwan.proto='static'
+uci set network.mgmtwan.device='br-wan'
+uci set network.mgmtwan.ipaddr='192.168.9.1'
+uci set network.mgmtwan.netmask='255.255.255.0'
+uci set network.mgmtwan.defaultroute='0'
+```
+
+情况 ②（OLT 带 tag、已按 6.4 配好 `bridge-vlan` 3114 = `pon0:t` + 2.5G 口 `u*`）：线上
+untagged 的流量在桥内属于 VLAN 3114，IP 挂在 `br-wan` 本体会落在默认 VLAN 1 里、从线上
+够不着，必须挂到该 VLAN 的子接口——与 6.7.2 脚本生成 `br-wan.2100` 的模式完全相同，
+原有的 `bridge-vlan` 3114 原样保留、无需改动：
+
+```sh
+uci set network.mgmtdev=device
+uci set network.mgmtdev.name='br-wan.3114'
+uci set network.mgmtdev.type='vlan'
+uci set network.mgmtdev.ifname='br-wan'
+uci set network.mgmtdev.vid='3114'
+
+uci set network.mgmtwan=interface
+uci set network.mgmtwan.proto='static'
+uci set network.mgmtwan.device='br-wan.3114'
+uci set network.mgmtwan.ipaddr='192.168.9.1'
+uci set network.mgmtwan.netmask='255.255.255.0'
+uci set network.mgmtwan.defaultroute='0'
+```
+
+防火墙（两种情况相同）：这个 IP 活在运营商广播域里（tag 场景下就是同 OLT 的用户 VLAN，
+理论上其它用户可达），**不要**把它并进 `lan` 区，而是单独建区、`input` 收紧为 `REJECT`，
+只放行 NAT 后源地址为 `192.168.9.254` 的流量——路由器自己和经过 masquerade 的下游设备
+源地址都是它：
+
+```sh
+uci add firewall zone
+uci set firewall.@zone[-1].name='mgmtwan'
+uci set firewall.@zone[-1].input='REJECT'
+uci set firewall.@zone[-1].output='ACCEPT'
+uci set firewall.@zone[-1].forward='REJECT'
+uci add_list firewall.@zone[-1].network='mgmtwan'
+
+# 只允许路由器（含经其 NAT 的下游设备）访问管理端口
+uci add firewall rule
+uci set firewall.@rule[-1].name='Allow-mgmt-from-router'
+uci set firewall.@rule[-1].src='mgmtwan'
+uci set firewall.@rule[-1].src_ip='192.168.9.254/32'
+uci set firewall.@rule[-1].proto='tcp'
+uci set firewall.@rule[-1].dest_port='22 80 443'
+uci set firewall.@rule[-1].target='ACCEPT'
+
+# 方便排错的 ICMP 放行（可选）
+uci add firewall rule
+uci set firewall.@rule[-1].name='Allow-mgmt-ping'
+uci set firewall.@rule[-1].src='mgmtwan'
+uci set firewall.@rule[-1].src_ip='192.168.9.254/32'
+uci set firewall.@rule[-1].proto='icmp'
+uci set firewall.@rule[-1].icmp_type='echo-request'
+uci set firewall.@rule[-1].target='ACCEPT'
+
+uci commit network && uci commit firewall
+/etc/init.d/network reload && /etc/init.d/firewall reload
+```
+
+**路由器侧**全部交给插件：
+
+1. iStore 应用市场或 `opkg install luci-app-ap-modem` 安装；
+2. LuCI → 网络 → **Access AP / Modem**：勾选 **Enable**，在 **WAN** 标签页的「Virtual
+   IP」填 `192.168.9.254`（**LAN 标签页留空**——那是给挂在路由器 LAN 下、管理 IP 在其它
+   网段的 AP 用的），保存并应用；
+3. 插件依赖 `wan` 区已开 masquerade（OpenWrt 默认开启），可用
+   `uci show firewall | grep masq` 确认。
+
+插件在每次开机/配置重载时按 `/etc/config/ap_modem` 自动生成并应用上述网络配置，取消
+Enable 或 `/etc/init.d/ap_modem stop` 即自动清理。它要求路由器 `lan` 设备名为 `br-lan`、
+`wan` 配置了 `device`（GL-MT5000 等原版配置均满足）。
+
+验证（路由器上）：
+
+```sh
+ip -br addr show eth1          # 应看到 192.168.9.254/24（插件的 vap_wan）
+ip -br addr show pppoe-wan     # PPPoE 仍在线：上网不受影响
+ping -c 2 192.168.9.1          # 路由器自己能通
+curl -sI http://192.168.9.1/   # 能取到光猫 LuCI 的响应头
+```
+
+然后任意下游设备打开 `http://192.168.9.1/` 即可。
+
+注意事项：
+
+- 那根线上可达的管理地址是 **`192.168.9.1` 而非 `192.168.1.1`**（同一个 LuCI、两个
+  入口）；千兆口插电脑仍是 `192.168.1.1`，行为不变。若一定要在线上直达 `192.168.1.1`，
+  只能回方案 B——插件不解 VLAN tag；
+- 隔离性不如方案 B：管理 IP 挂在运营商广播域内，靠上面的源地址限制兜底；方案 B 的独立
+  管理 VLAN 与运营商域完全隔离，安全性更好。本方案换来的是路由器侧零手工配置、光猫侧
+  只加一个 IP；
+- 光猫侧改动**不碰桥和端口成员**，配错最多少一个入口，不会像方案 B 那样有失去全部有线
+  管理入口的风险。回滚：`uci delete network.mgmtwan`（情况 ② 再执行
+  `uci delete network.mgmtdev`），删掉 `mgmtwan` 区与两条规则，重载 network/firewall 即可；
+- 路由器 LAN 网段比方案 A/B 宽松：即使 LAN 也是 `192.168.1.0/24` 也不冲突（路由器侧
+  管理网段是 `192.168.9.0/24`），但**不能**把 LAN 设成 `192.168.9.0/24`——插件会自动
+  跳过与 LAN 重叠的虚拟 IP，导致配置不生效；
+- 两端改动分别落在光猫的 `/etc/config/network`、`/etc/config/firewall` 与路由器的
+  `/etc/config/ap_modem`，均属 sysupgrade 保留范围（路由器侧的网络配置由插件每次开机
+  重新生成，无需手工持久化）。
 
 ## 7. 救砖
 
