@@ -578,6 +578,73 @@ uci set network.mgmtwan.netmask='255.255.255.0'
 uci set network.mgmtwan.defaultroute='0'
 ```
 
+**从方案 B 迁移过来**（已按 6.7.2 跑过单线复用脚本、管理 IP 在 `br-wan.2100` 上的机器）：
+直接删 2100 会让千兆口失去管理入口，按「先建新路、再拆旧路」的顺序做，每一步都至少保有
+一个可用入口（下述顺序实测可用）：
+
+① 光猫：先按情况 ② 加 `mgmtwan` —— `192.168.9.1` 立即可用，之后全程兜底；
+
+② 路由器：按下文启用插件（旧配置还在也不冲突，插件用的是新网段），再删掉方案 B 的
+手工配置：
+
+```sh
+uci -q delete network.modem          # eth1.2100 上的 192.168.1.2 静态接口
+uci -q delete network.modemvlan      # eth1.2100 VLAN 设备
+# 删 modem 防火墙区与 lan→modem 转发（编号以 uci show firewall 实际输出为准）
+uci -q delete firewall.@zone[2]
+uci -q delete firewall.@forwarding[1]
+uci commit network && uci commit firewall
+/etc/init.d/network reload && /etc/init.d/firewall reload
+```
+
+③ 光猫：拆 2100，并把千兆口的管理 IP 安置到 **VLAN 1 子接口**上：
+
+```sh
+# 删 vid 2100 的 bridge-vlan 条目与 br-wan.2100 设备段（段名可能是 mgmtvlan 或
+# singlewire，以 uci show network 实际输出为准）
+i=0
+while uci -q get network.@bridge-vlan[$i] >/dev/null; do
+	[ "$(uci -q get network.@bridge-vlan[$i].vlan)" = "2100" ] && uci -q delete "network.@bridge-vlan[$i]" && break
+	i=$((i+1))
+done
+uci -q delete network.mgmtvlan
+
+# 千兆口改走 VLAN 1（条目 + 子接口），lan 挂到子接口上
+uci add network bridge-vlan
+uci set network.@bridge-vlan[-1].device='br-wan'
+uci set network.@bridge-vlan[-1].vlan='1'
+uci add_list network.@bridge-vlan[-1].ports='lan2:u*'
+uci add_list network.@bridge-vlan[-1].ports='lan3:u*'
+uci add_list network.@bridge-vlan[-1].ports='lan4:u*'
+uci set network.lanvlan=device
+uci set network.lanvlan.name='br-wan.1'
+uci set network.lanvlan.type='vlan'
+uci set network.lanvlan.ifname='br-wan'
+uci set network.lanvlan.vid='1'
+uci set network.lan.device='br-wan.1'
+
+uci commit network
+/etc/init.d/network reload
+```
+
+迁移后千兆口行为不变：插电脑仍可打开 `http://192.168.1.1/`、自动获取 DHCP。可用
+`bridge vlan show` 核对——`lan2/3/4` 应为 `1 PVID Egress Untagged`，`lan1` 仍为
+`3114 PVID Egress Untagged`。
+
+> **注意（从方案 B 迁移）**：下面两个坑都实测踩过，配错的症状酷似硬件故障，动手前先看：
+>
+> - **`lan` 的 IP 不能挂回 `br-wan` 本体**。桥开着 `vlan_filtering` 且存在 `bridge-vlan`
+>   条目时，各 VLAN 送往本机协议栈的帧是带 tag 的，只有对应 vid 的**子接口**收得到；
+>   IP 挂在桥本体上时千兆口完全不通——下游 ARP 一直 `Incomplete`、DHCP 无响应、抓包
+>   只见发不见收，而光猫桥的收包统计照常增长，非常像网卡/链路单向故障。方案 B 的
+>   `br-wan.2100`、方案 C 的 `br-wan.3114` 一直正常，正因为它们都是子接口；千兆口
+>   管理 IP 放 `br-wan.1` 与二者同构。
+> - **`br-wan` 会被先声明的接口抢占**。`wan`（proto none 占位接口）的 `device` 仍是
+>   `br-wan` 时，若把 `lan.device` 也指到 `br-wan`，netifd 会把桥判给 `wan`、`lan`
+>   一直起不来（`ubus call network.interface dump` 里 lan 没有 IPv4 地址）。把 `lan`
+>   挂到 `br-wan.1` 子接口即可避开；若坚持挂桥本体，必须先
+>   `uci -q delete network.wan.device`。
+
 防火墙（两种情况相同）：这个 IP 活在运营商广播域里（tag 场景下就是同 OLT 的用户 VLAN，
 理论上其它用户可达），**不要**把它并进 `lan` 区，而是单独建区、`input` 收紧为 `REJECT`，
 只放行 NAT 后源地址为 `192.168.9.254` 的流量——路由器自己和经过 masquerade 的下游设备
@@ -645,9 +712,12 @@ curl -sI http://192.168.9.1/   # 能取到光猫 LuCI 的响应头
 - 隔离性不如方案 B：管理 IP 挂在运营商广播域内，靠上面的源地址限制兜底；方案 B 的独立
   管理 VLAN 与运营商域完全隔离，安全性更好。本方案换来的是路由器侧零手工配置、光猫侧
   只加一个 IP；
-- 光猫侧改动**不碰桥和端口成员**，配错最多少一个入口，不会像方案 B 那样有失去全部有线
-  管理入口的风险。回滚：`uci delete network.mgmtwan`（情况 ② 再执行
-  `uci delete network.mgmtdev`），删掉 `mgmtwan` 区与两条规则，重载 network/firewall 即可；
+- 光猫侧改动**不碰桥的端口成员**（从方案 B 迁移会额外增删 `bridge-vlan` 条目），配错最
+  多少一个入口，不会像方案 B 那样有失去全部有线管理入口的风险。回滚：`uci delete
+  network.mgmtwan`（情况 ② 再执行 `uci delete network.mgmtdev`），删掉 `mgmtwan` 区与
+  两条规则，重载 network/firewall 即可；从方案 B 迁移过的机器再删 `lanvlan` 与 vid 1
+  的 `bridge-vlan` 条目、把 `lan.device` 指回 `br-wan.2100` 并按 6.7.2 重建 2100 条目，
+  即完整回到方案 B；
 - 路由器 LAN 网段比方案 A/B 宽松：即使 LAN 也是 `192.168.1.0/24` 也不冲突（路由器侧
   管理网段是 `192.168.9.0/24`），但**不能**把 LAN 设成 `192.168.9.0/24`——插件会自动
   跳过与 LAN 重叠的虚拟 IP，导致配置不生效；
