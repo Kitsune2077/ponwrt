@@ -3,9 +3,9 @@
 'require fs';
 'require uci';
 
-/* Compact PON card for Status -> Overview. Reads the same data as the
- * luci-app-pon status page (ponctl/pondctl), so the exec permissions are
- * already granted by the luci-app-pon rpcd ACL. */
+/* 概览页 PON 状态卡片。数据源与 luci-app-pon 状态页相同（ponctl/pondctl），
+ * 执行权限由 luci-app-pon 的 rpcd ACL 覆盖。
+ * 文案直接使用中文 msgid（_() 无翻译目录时回显原文），不依赖 .lmo。 */
 
 var modeLabels = {
 	gpon: _('GPON'),
@@ -17,69 +17,69 @@ var modeLabels = {
 };
 
 var lifecycleLabels = {
-	stopped: _('Stopped'),
-	'wait-optical-signal': _('Waiting for optical signal'),
-	'pma-configured': _('PMA configured'),
-	'wait-line-sync': _('Waiting for line synchronization'),
-	'protocol-activating': _('Protocol activation in progress'),
-	operational: _('Operational'),
-	error: _('Error')
+	stopped: _('已停止'),
+	'wait-optical-signal': _('等待光信号'),
+	'pma-configured': _('PMA 已配置'),
+	'wait-line-sync': _('等待线路同步'),
+	'protocol-activating': _('协议激活中'),
+	operational: _('运行中'),
+	error: _('错误')
 };
 
 var syncLabels = {
-	'not-applicable': _('Not applicable'),
-	hunt: _('Hunt'),
-	'pre-sync': _('Pre-sync'),
-	'in-sync': _('Synchronized'),
-	're-sync': _('Re-synchronizing')
+	'not-applicable': _('不适用'),
+	hunt: _('搜索同步'),
+	'pre-sync': _('预同步'),
+	'in-sync': _('已同步'),
+	're-sync': _('重新同步中')
 };
 
 var onuStateLabels = {
-	O1: _('O1 — Initial'),
-	O2_3: _('O2-3 — Serial number'),
-	O4: _('O4 — Ranging'),
-	O5: _('O5 — Operation'),
-	O7: _('O7 — Emergency stop')
+	O1: _('O1 — 初始状态'),
+	O2_3: _('O2-3 — 序列号'),
+	O4: _('O4 — 测距'),
+	O5: _('O5 — 运行'),
+	O7: _('O7 — 紧急停止')
 };
 
 var mpcpLabels = {
-	wait: _('Waiting for discovery'),
-	registering: _('Waiting for Discovery Gate'),
-	'register-request': _('Register Request sent'),
-	'register-pending': _('Register received; ACK pending'),
-	registered: _('Registered'),
-	denied: _('Registration denied')
+	wait: _('等待发现'),
+	registering: _('等待发现门'),
+	'register-request': _('已发送注册请求'),
+	'register-pending': _('收到注册，ACK 待发'),
+	registered: _('已注册'),
+	denied: _('注册被拒绝')
 };
 
 var authLabels = {
-	'not-requested': _('OLT did not request authentication'),
-	pending: _('Pending'),
-	'not-reported': _('Not reported'),
-	'not-authenticated': _('Not authenticated'),
-	accepted: _('Accepted'),
-	'loid-not-found': _('LOID does not exist'),
-	'password-mismatch': _('LOID exists, but the password is incorrect'),
-	'loid-conflict': _('LOID is already authenticated by another ONU'),
-	'reserved-status': _('Reserved authentication status')
+	'not-requested': _('OLT 未请求认证'),
+	pending: _('等待中'),
+	'not-reported': _('OLT 尚未上报'),
+	'not-authenticated': _('未通过认证'),
+	accepted: _('已通过'),
+	'loid-not-found': _('LOID 不存在'),
+	'password-mismatch': _('LOID 存在但密码错误'),
+	'loid-conflict': _('LOID 已被其它 ONU 认证'),
+	'reserved-status': _('保留的认证状态')
 };
 
 function lookup(map, key) {
-	return (key != null && key !== '' && map[key]) || key || _('Unknown');
+	return (key != null && key !== '' && map[key]) || key || _('未知');
 }
 
 function booleanLabel(value) {
 	if (value === true || value === 1 || value === '1')
-		return _('Yes', 'PON status boolean');
+		return _('是');
 	if (value === false || value === 0 || value === '0')
-		return _('No', 'PON status boolean');
-	return _('Unknown');
+		return _('否');
+	return _('未知');
 }
 
 function frontendMetric(frontend, field, unit) {
 	if (frontend == null || frontend.error)
-		return _('Read failed');
+		return _('读取失败');
 	if (frontend[field] == null)
-		return _('Not supported');
+		return _('不支持');
 	return Number(frontend[field]).toFixed(2) + ' ' + unit;
 }
 
@@ -96,7 +96,7 @@ function execJSON(command, args) {
 function row(label, value) {
 	return E('tr', {}, [
 		E('td', { 'style': 'width: 42%' }, label),
-		E('td', {}, (value == null || value === '') ? _('Unknown') : String(value))
+		E('td', {}, (value == null || value === '') ? _('未知') : String(value))
 	]);
 }
 
@@ -110,22 +110,22 @@ function lineRows(item, omci) {
 	    rows;
 
 	rows = [
-		row(_('Line mode'), lookup(modeLabels, mode || 'none')),
-		row(_('Line state'), lookup(lifecycleLabels, line.lifecycle)),
-		row(epon ? _('MPCP state') : _('ONU state'),
+		row(_('线路模式'), lookup(modeLabels, mode || 'none')),
+		row(_('线路状态'), lookup(lifecycleLabels, line.lifecycle)),
+		row(epon ? _('MPCP 状态') : _('ONU 状态'),
 		    epon ? lookup(mpcpLabels, registration.mpcp_state)
 		         : lookup(onuStateLabels, registration.onu_state)),
 		row(epon ? _('LLID') : _('ONU-ID'),
-		    epon ? (registration.llid_valid === true ? registration.llid : _('Not assigned'))
-		         : (registration.onu_id_valid === true ? registration.onu_id : _('Not assigned'))),
-		row(_('Optical signal detected'), booleanLabel(line.optical_signal)),
-		row(_('Receive optical power'), frontendMetric(frontend, 'rx_power_dbm', 'dBm')),
-		row(_('Transmit optical power'), frontendMetric(frontend, 'tx_power_dbm', 'dBm')),
-		row(_('Optical frontend temperature'), frontendMetric(frontend, 'temperature_celsius', '°C'))
+		    epon ? (registration.llid_valid === true ? registration.llid : _('未分配'))
+		         : (registration.onu_id_valid === true ? registration.onu_id : _('未分配'))),
+		row(_('已检测到光信号'), booleanLabel(line.optical_signal)),
+		row(_('接收光功率'), frontendMetric(frontend, 'rx_power_dbm', 'dBm')),
+		row(_('发射光功率'), frontendMetric(frontend, 'tx_power_dbm', 'dBm')),
+		row(_('光模块温度'), frontendMetric(frontend, 'temperature_celsius', '°C'))
 	];
 
 	if (!epon) {
-		rows.push(row(mode === 'gpon' ? _('GTC state') : _('XGTC state'),
+		rows.push(row(mode === 'gpon' ? _('GTC 状态') : _('XGTC 状态'),
 		    lookup(syncLabels, line.xgtc_sync)));
 
 		if (omci != null) {
@@ -134,9 +134,9 @@ function lineRows(item, omci) {
 				.join(' / ');
 
 			rows.push(
-				row(_('OMCI channel online'), booleanLabel(omci.channel_available)),
-				row(_('OLT equipment ID'), olt || _('Unknown')),
-				row(_('LOID authentication'), lookup(authLabels, omci.authentication_meaning)));
+				row(_('OMCI 通道在线'), booleanLabel(omci.channel_available)),
+				row(_('OLT 设备 ID'), olt || _('未知')),
+				row(_('LOID 认证结果'), lookup(authLabels, omci.authentication_meaning)));
 		}
 	}
 
@@ -160,12 +160,12 @@ return baseclass.extend({
 				var device = s.device || '';
 
 				if (!device)
-					return Promise.resolve({ section: s, error: _('No device configured') });
+					return Promise.resolve({ section: s, error: _('未配置设备') });
 
 				return execJSON('/usr/sbin/ponctl', [ '--device', device, 'status', '--json' ])
 					.then(function(snapshot) {
 						if (snapshot == null || snapshot.schema_version !== 1 || !snapshot.line)
-							return { section: s, error: _('Unable to read PON line status') };
+							return { section: s, error: _('无法读取 PON 线路状态') };
 
 						return { section: s, snapshot: snapshot };
 					});
@@ -199,12 +199,12 @@ return baseclass.extend({
 			var rows;
 
 			if (item.error)
-				rows = [ row(_('Error'), item.error) ];
+				rows = [ row(_('错误'), item.error) ];
 			else
 				rows = lineRows(item, omciByLine[item.section['.name']]);
 
 			if (data.lines.length > 1)
-				rows.unshift(row(_('Line'), item.section['.name']));
+				rows.unshift(row(_('线路'), item.section['.name']));
 
 			return E('table', { 'class': 'table' }, rows);
 		});
@@ -213,7 +213,7 @@ return baseclass.extend({
 			E('a', {
 				'href': L.url('admin/network/pon/status'),
 				'class': 'button'
-			}, [ _('PON status'), ' »' ])));
+			}, [ _('PON 状态'), ' »' ])));
 
 		return E('div', { 'id': 'pon_overview_status' }, nodes);
 	}

@@ -6,20 +6,19 @@
 'require ui';
 'require uci';
 
-/* PON provisioning wizard: bridge the 2.5G port for downstream PPPoE,
- * set the operator VLAN tag, and pick a management-access scheme
- * (FLASHING.md sections 6 / 6.4 / 6.7). The form is prefilled from the
- * DETECTED state reported by pon-wizard-apply, so a modem that already
- * runs scheme B or C (applied by hand or by ponwrt-single-wire.sh) shows
- * the matching options checked. */
+/* PON 接入向导：桥接 2.5G 口给下游 PPPoE、设置运营商 VLAN、选择管理访问
+ * 方案（FLASHING.md 第 6 / 6.4 / 6.7 节）。表单按 pon-wizard-apply 报告的
+ * 「实际状态」预填——已手工配置过方案 B/C 的光猫打开即勾选对应选项。
+ *
+ * 文案直接使用中文 msgid（_() 在无翻译目录时回显原文），不依赖 .lmo。 */
 
 var APPLY = '/usr/libexec/pon-wizard-apply';
 
 var schemeLabels = {
-	none: _('Disabled (remove applied management access)'),
-	A: _('Scheme A — second management cable (no modem-side change)'),
-	B: _('Scheme B — management VLAN over the single wire'),
-	C: _('Scheme C — untagged management IP + router plugin')
+	none: _('禁用（清除已应用的管理访问配置）'),
+	A: _('方案 A —— 单独一根管理网线（光猫侧无需改动）'),
+	B: _('方案 B —— 单线复用（管理 VLAN 打 tag）'),
+	C: _('方案 C —— 单线并存（untagged 管理 IP + 路由器插件）')
 };
 
 function execJSON(args) {
@@ -37,8 +36,7 @@ function fetchStatus() {
 }
 
 function effective(detected, declared, key, dkey) {
-	/* detected wins over the stored declaration: a modem already running
-	 * scheme B/C (configured manually) must open with those boxes checked */
+	/* 实际状态优先于保存的声明：手工配置过 B/C 的光猫打开即勾选 */
 	var d = detected;
 	if (dkey != null) {
 		d = null;
@@ -103,9 +101,9 @@ return view.extend({
 		}, this), 3);
 
 		return E('div', { 'class': 'cbi-map' }, [
-			E('h2', {}, _('PON provisioning wizard')),
+			E('h2', {}, _('PON 接入向导')),
 			E('div', { 'class': 'cbi-map-descr' },
-				_('Bridge the 2.5G port for downstream PPPoE, set the operator VLAN, and choose how the modem management page is reached. Existing configurations are detected automatically.')),
+				_('桥接 2.5G 口给下游 PPPoE 拨号、设置运营商 VLAN，并选择下游路由器访问光猫管理页的方式。已有配置会被自动识别。')),
 			container
 		]);
 	},
@@ -114,39 +112,39 @@ return view.extend({
 		if (status == null)
 			return E('div', { 'class': 'cbi-section' },
 				E('p', { 'class': 'alert-message warning' },
-					_('Unable to read the current state (%s is missing or failed).').format(APPLY)));
+					_('无法读取当前状态（%s 缺失或执行失败）。').format(APPLY)));
 
 		var mgmt;
 		switch (status.mgmt.scheme) {
 			case 'B':
-				mgmt = _('Scheme B (management VLAN %s)').format(status.mgmt.vid);
+				mgmt = _('方案 B（管理 VLAN %s）').format(status.mgmt.vid);
 				break;
 			case 'C':
-				mgmt = _('Scheme C (%s on %s, only %s allowed)').format(
+				mgmt = _('方案 C（%s 挂 %s，仅放行 %s）').format(
 					status.mgmt.ip, status.mgmt.parent, status.mgmt.router || '?');
 				break;
 			default:
-				mgmt = _('None');
+				mgmt = _('无');
 		}
 
 		var row = function(l, v) {
 			return E('tr', {}, [
 				E('td', { 'style': 'width: 42%' }, l),
-				E('td', {}, (v == null || v === '') ? _('Unknown') : String(v))
+				E('td', {}, (v == null || v === '') ? _('未知') : String(v))
 			]);
 		};
 
 		return E('div', { 'class': 'cbi-section' }, [
-			E('h3', {}, _('Detected state')),
+			E('h3', {}, _('检测到的状态')),
 			E('div', { 'id': 'pw-sync-slot' }, !status.in_sync
 				? E('p', { 'class': 'alert-message notice' },
-					_('The detected configuration differs from the saved declaration. Saving will reconcile the system to the form below.'))
+					_('检测到的实际配置与保存的声明不一致：保存后系统将按下方表单收敛。'))
 				: E([])),
 			E('table', { 'class': 'table' }, [
-				row(_('Bridged for downstream PPPoE'),
-					status.bridged ? _('yes (%s = %s + %s)').format(status.pon_bridge, status.pon_port, status.port25) : _('no')),
-				row(_('Operator VLAN'), status.isp_vid || _('none (untagged)')),
-				row(_('Management access'), mgmt)
+				row(_('已桥接给下游 PPPoE'),
+					status.bridged ? _('是（%s = %s + %s）').format(status.pon_bridge, status.pon_port, status.port25) : _('否')),
+				row(_('运营商 VLAN'), status.isp_vid || _('无（untagged）')),
+				row(_('管理访问'), mgmt)
 			]),
 			E('div', { 'id': 'pw-timer-slot' }, this.renderTimer(status))
 		]);
@@ -161,20 +159,20 @@ return view.extend({
 		var ss = String(secs % 60).padStart(2, '0');
 
 		return E('p', { 'class': 'alert-message warning' }, [
-			E('strong', {}, _('Rollback armed: ')), ' ',
-			_('changes were applied but not confirmed yet; they will be reverted in %s:%s.').format(mm, ss), ' ',
+			E('strong', {}, _('回滚保险已武装：')), ' ',
+			_('配置已应用但尚未确认，%s:%s 后将自动恢复原状。').format(mm, ss), ' ',
 			E('button', {
 				'class': 'btn cbi-button cbi-button-apply important',
 				'click': ui.createHandlerFn(this, function() {
 					return fs.exec_direct(APPLY, [ 'confirm' ]).then(L.bind(this.refresh, this));
 				})
-			}, _('Keep configuration')), ' ',
+			}, _('确认保留')), ' ',
 			E('button', {
 				'class': 'btn cbi-button cbi-button-reset',
 				'click': ui.createHandlerFn(this, function() {
 					return fs.exec_direct(APPLY, [ 'revert' ]).then(L.bind(this.refresh, this));
 				})
-			}, _('Revert now'))
+			}, _('立即回滚'))
 		]);
 	},
 
@@ -192,7 +190,7 @@ return view.extend({
 		var vMgmtIp = detMgmt.ip || declared.mgmt_ip || '192.168.9.1';
 		var vMgmtRtr = detMgmt.router || declared.mgmt_router_ip || '192.168.9.254';
 
-		/* port candidates: detected GbE ports + detected/declared 2.5G port */
+		/* 端口候选：检测到的千兆口 + 检测/声明的 2.5G 口 */
 		var portCand = (det.gbe_ports || []).slice();
 		[ vPort25, 'lan1' ].forEach(function(p) {
 			if (p && portCand.indexOf(p) < 0)
@@ -244,24 +242,24 @@ return view.extend({
 
 				var errors = [];
 				if (vlanEn && !validVid(vlan))
-					errors.push(_('Operator VLAN must be 1..4094.'));
+					errors.push(_('运营商 VLAN 必须是 1..4094。'));
 				if (scheme == 'B') {
 					if (!validVid(mvid))
-						errors.push(_('Management VLAN must be 1..4094.'));
+						errors.push(_('管理 VLAN 必须是 1..4094。'));
 					else if (vlanEn && mvid == vlan)
-						errors.push(_('Management VLAN must differ from the operator VLAN.'));
+						errors.push(_('管理 VLAN 不能与运营商 VLAN 相同。'));
 				}
 				if (scheme == 'C') {
 					if (!ipv4Re.test(mip))
-						errors.push(_('Management IP must be an IPv4 address, e.g. 192.168.9.1.'));
+						errors.push(_('管理 IP 需要是 IPv4 地址，如 192.168.9.1。'));
 					if (!ipv4Re.test(mrtr))
-						errors.push(_('Router virtual IP must be an IPv4 address, e.g. 192.168.9.254.'));
+						errors.push(_('路由器虚拟 IP 需要是 IPv4 地址，如 192.168.9.254。'));
 				}
 				if (errors.length) {
-					ui.showModal(_('Invalid input'), [
+					ui.showModal(_('输入有误'), [
 						E('ul', {}, errors.map(function(e) { return E('li', {}, e); })),
 						E('div', { 'class': 'right' },
-							E('button', { 'class': 'btn', 'click': ui.hideModal }, _('Dismiss')))
+							E('button', { 'class': 'btn', 'click': ui.hideModal }, _('关闭')))
 					]);
 					return Promise.resolve();
 				}
@@ -279,31 +277,31 @@ return view.extend({
 					.then(function() { return L.resolveDefault(fs.exec_direct(APPLY, [ 'apply' ]), null); })
 					.then(function(output) {
 						out.style.display = '';
-						dom.content(out, output || _('Apply failed — refresh the page to re-read the state.'));
+						dom.content(out, output || _('应用失败 —— 刷新页面重新读取状态。'));
 						return self.refresh();
 					});
 			})
-		}, _('Save and apply'));
+		}, _('保存并应用'));
 
 		blockB.append(
-			fieldRow(_('Management VLAN (scheme B)'), elMgmtVlan,
-				_('Tagged on the 2.5G port, untagged on the GbE ports; the management IP moves to the VLAN sub-interface. Configure the router side per FLASHING.md 6.7.2.')));
+			fieldRow(_('管理 VLAN（方案 B）'), elMgmtVlan,
+				_('2.5G 口带 tag、千兆口剥 tag，管理 IP 移到该 VLAN 子接口。路由器侧按 FLASHING.md 6.7.2 配置。')));
 		blockC.append(
-			fieldRow(_('Management IP (scheme C)'), elMgmtIp,
-				_('Static IP on the WAN bridge (or its operator-VLAN sub-interface), must be a fresh subnet, e.g. 192.168.9.0/24.')),
-			fieldRow(_('Router virtual IP (scheme C)'), elMgmtRtr,
-				_('The only source address allowed to reach the management ports; configure the same value in the luci-app-ap-modem plugin on the router.')));
+			fieldRow(_('管理 IP（方案 C）'), elMgmtIp,
+				_('挂在 WAN 桥（或其运营商 VLAN 子接口）上的静态 IP，必须用新网段，如 192.168.9.0/24。')),
+			fieldRow(_('路由器虚拟 IP（方案 C）'), elMgmtRtr,
+				_('唯一允许访问管理端口的源地址；路由器侧 luci-app-ap-modem 插件里填同一个值。')));
 
 		return E('div', { 'class': 'cbi-section' }, [
-			E('h3', {}, _('Desired configuration')),
+			E('h3', {}, _('期望配置')),
 
-			fieldRow(_('Bridge 2.5G port for PPPoE'), elBridged,
-				_('Creates the pure L2 bridge (PON port + 2.5G port) and points WAN at it with no protocol. Unchecking does not tear the bridge down.')),
-			fieldRow(_('2.5G port name'), elPort25,
-				_('Used when creating the bridge; auto-detected on bridged modems (verify with "ip -br link" on a new board).')),
-			fieldRow(_('Operator VLAN tag'), [ elVlanEn, ' ', elVlan ],
-				_('Enable when the OLT delivers the internet service tagged (e.g. 3114); the 2.5G side stays untagged for the router PPPoE.')),
-			fieldRow(_('Management access scheme'), elScheme),
+			fieldRow(_('桥接 2.5G 口给下游 PPPoE'), elBridged,
+				_('建立纯二层桥（光口 + 2.5G 口）并把 WAN 指向它、协议设为「无」。取消勾选不会拆除已有桥。')),
+			fieldRow(_('2.5G 口名称'), elPort25,
+				_('建桥时使用；已桥接的光猫会自动检测（换板子先在 SSH 里 ip -br link 确认）。')),
+			fieldRow(_('运营商 VLAN tag'), [ elVlanEn, ' ', elVlan ],
+				_('OLT 下发的上网业务带 tag 时勾选（如 3114）；2.5G 侧保持 untagged 给路由器 PPPoE。')),
+			fieldRow(_('管理访问方案'), elScheme),
 
 			blockB,
 			blockC,
