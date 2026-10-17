@@ -22,6 +22,8 @@ replication are not implemented yet.
 
 Signed-off-by: Kitsune <km2077@foxmail.com>
 ---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index c3e5a98f7..6a128e540 100644
 --- a/drivers/net/ethernet/airoha/airoha_eth.h
 +++ b/drivers/net/ethernet/airoha/airoha_eth.h
 @@ -560,6 +560,14 @@ struct airoha_flow_table_entry {
@@ -39,7 +41,7 @@ Signed-off-by: Kitsune <km2077@foxmail.com>
  	struct airoha_foe_stats64 stats;
  	enum airoha_flow_entry_type type;
  
-@@ -576,6 +584,39 @@ struct airoha_flow_table_entry {
+@@ -576,6 +584,30 @@ struct airoha_flow_table_entry {
  	struct airoha_foe_entry data;
  };
  
@@ -54,14 +56,6 @@ Signed-off-by: Kitsune <km2077@foxmail.com>
 +	u16 vid;
 +};
 +
-+enum airoha_fdb_flags {
-+	/* The software bridge would rewrite the VLAN tag on this egress port.
-+	 * Tag push/pop on the native AN7581 L2B entry has not been verified
-+	 * on hardware yet, so such entries stay in the software bridge.
-+	 */
-+	AIROHA_FDB_F_NO_OFFLOAD,
-+};
-+
 +struct airoha_fdb_entry {
 +	struct rhash_head node;
 +
@@ -73,13 +67,12 @@ Signed-off-by: Kitsune <km2077@foxmail.com>
 +
 +	struct airoha_fdb_key key;
 +	struct net_device *egress;
-+	unsigned long flags;
 +};
 +
  struct airoha_wdma_info {
  	u8 idx;
  	u8 queue;
-@@ -717,6 +758,17 @@ struct airoha_ppe {
+@@ -717,6 +749,18 @@ struct airoha_ppe {
  
  	struct rhashtable l2_flows;
  
@@ -89,15 +82,16 @@ Signed-off-by: Kitsune <km2077@foxmail.com>
 +
 +	/* Bridge FDB offload counters. */
 +	struct {
-+		unsigned long promoted; /* L2 flows promoted from the FDB */
-+		unsigned long no_entry; /* no FDB entry for the destination */
-+		unsigned long tagged;   /* tagged frame, left to the bridge */
++		unsigned long promoted;     /* L2 flows promoted from the FDB */
++		unsigned long no_entry;     /* no FDB entry for the destination */
++		unsigned long vlan_rewrite; /* tag push/pop needed, see promote */
++		unsigned long no_npu;       /* NPU not configured, promote skipped */
 +	} fdb_stats;
 +
  	struct hlist_head *foe_flow;
  	u16 *foe_check_time;
  
-@@ -840,6 +892,8 @@ airoha_qdma_deref(struct airoha_gdm_dev *dev)
+@@ -840,6 +884,8 @@ airoha_qdma_deref(struct airoha_gdm_dev *dev)
  void airoha_ppe_set_mtu(struct airoha_gdm_dev *dev);
  void airoha_ppe_set_cpu_port(struct airoha_gdm_dev *dev, u8 ppe_id, u8 fport);
  void airoha_ppe_remove_egress_flows(struct airoha_gdm_dev *dev);
@@ -106,9 +100,19 @@ Signed-off-by: Kitsune <km2077@foxmail.com>
  bool airoha_ppe_is_enabled(struct airoha_eth *eth, int index);
  void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
  			  u16 hash, bool rx_wlan);
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index 20842789c..78facd8d0 100644
 --- a/drivers/net/ethernet/airoha/airoha_ppe.c
 +++ b/drivers/net/ethernet/airoha/airoha_ppe.c
-@@ -38,6 +38,13 @@ static const struct rhashtable_params airoha_l2_flow_table_params = {
+@@ -9,6 +9,7 @@
+ #include <linux/ipv6.h>
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
++#include <linux/if_bridge.h>
+ #include <linux/rhashtable.h>
+ #include <net/ipv6.h>
+ #include <linux/if_vlan.h>
+@@ -38,6 +39,13 @@ static const struct rhashtable_params airoha_l2_flow_table_params = {
  	.automatic_shrinking = true,
  };
  
@@ -122,8 +126,32 @@ Signed-off-by: Kitsune <km2077@foxmail.com>
  static int airoha_ppe_get_num_stats_entries(struct airoha_ppe *ppe)
  {
  	if (!IS_ENABLED(CONFIG_NET_AIROHA_FLOW_STATS))
-@@ -1059,14 +1066,24 @@ commit:
- 	return 0;
+@@ -1008,7 +1016,7 @@ airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *ppe,
+ 	u32 mask = AIROHA_FOE_IB1_BIND_PACKET_TYPE | AIROHA_FOE_IB1_BIND_UDP;
+ 	struct airoha_foe_entry *hwe_p, hwe;
+ 	struct airoha_flow_table_entry *f;
+-	int type;
++	int err, type;
+ 
+ 	hwe_p = airoha_ppe_foe_get_entry_locked(ppe, hash);
+ 	if (!hwe_p)
+@@ -1054,19 +1062,37 @@ airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *ppe,
+ 
+ 	hwe.bridge.data = e->data.bridge.data;
+ commit:
+-	airoha_ppe_foe_commit_entry(ppe, &hwe, hash, rx_wlan);
++	err = airoha_ppe_foe_commit_entry(ppe, &hwe, hash, rx_wlan);
++	if (err) {
++		/* Do not leave a software subflow behind that the hardware never
++		 * learned: callers must only count a promotion that reached the
++		 * PPE.
++		 */
++		hlist_del_init(&f->l2_subflow_node);
++		kfree(f);
++	}
+ 
+-	return 0;
++	return err;
  }
  
 -static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
@@ -151,7 +179,7 @@ Signed-off-by: Kitsune <km2077@foxmail.com>
  	struct hlist_node *n;
  	u32 index, state;
  
-@@ -1083,8 +1100,10 @@ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+@@ -1083,8 +1109,10 @@ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
  	/* Native L2B uses its learned key, not an IPv4/L4 software hash bucket. */
  	if (airoha_is_7581(ppe->eth) &&
  	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1) ==
@@ -163,7 +191,7 @@ Signed-off-by: Kitsune <km2077@foxmail.com>
  
  	index = airoha_ppe_foe_get_entry_hash(ppe, hwe);
  	hlist_for_each_entry_safe(e, n, &ppe->foe_flow[index], list) {
-@@ -1112,10 +1131,20 @@ l2_lookup:
+@@ -1112,10 +1140,20 @@ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
  	airoha_ppe_foe_set_bridge_addrs(&br, eth_hdr(skb));
  	e = rhashtable_lookup_fast(&ppe->l2_flows, &br,
  				   airoha_l2_flow_table_params);
@@ -185,28 +213,58 @@ Signed-off-by: Kitsune <km2077@foxmail.com>
  }
  
  static int
-@@ -1158,6 +1187,295 @@ static int airoha_ppe_foe_flow_commit_entry(struct airoha_ppe *ppe,
+@@ -1133,9 +1171,15 @@ airoha_ppe_foe_l2_flow_commit_entry(struct airoha_ppe *ppe,
+ 	if (IS_ERR(prev))
+ 		return PTR_ERR(prev);
+ 
+-	return rhashtable_replace_fast(&ppe->l2_flows, &prev->l2_node,
+-				       &e->l2_node,
+-				       airoha_l2_flow_table_params);
++	/* Never replace an entry that is already installed for this
++	 * (source MAC, destination MAC, VLAN) triple: it can belong to the
++	 * netfilter offload path, and dropping it here would free an object
++	 * that path still owns. The callers that can hit this race look the
++	 * existing entry up first and reuse it, see
++	 * airoha_ppe_bridge_fdb_promote(); the remaining window is a clean
++	 * failure and the frame stays in the software bridge.
++	 */
++	return -EEXIST;
+ }
+ 
+ static int airoha_ppe_foe_flow_commit_entry(struct airoha_ppe *ppe,
+@@ -1158,6 +1202,373 @@ static int airoha_ppe_foe_flow_commit_entry(struct airoha_ppe *ppe,
  	return 0;
  }
  
-+/* v1 only offloads destinations the software bridge would emit untagged.
++/* True when a frame forwarded to @egress in @vid needs no VLAN tag rewrite,
++ * i.e. when the egress bridge port emits it untagged.
 + *
-+ * A non-zero VLAN means the bridge tracks a VLAN on this egress port and the
-+ * frame may need a tag push or pop that the PPE template built below does not
-+ * describe: airoha_ppe_foe_entry_prepare() only records tags coming from
-+ * FLOW_ACTION_VLAN_PUSH actions and the driver treats FLOW_ACTION_VLAN_POP
-+ * as a no-op, so the strip case cannot be expressed yet.
++ * vid 0 is the untagged domain used by a bridge without VLAN filtering (and
++ * by a VLAN-filtering bridge that has no PVID): there is no tag to add or
++ * strip. For a real VLAN, ask the bridge for the membership flags of the
++ * egress port; @egress is a bridge port here. The RCU variant is used because
++ * this runs in the RX path and may be called with ppe_lock held.
 + *
-+ * TODO(AN7581 tag handling): ask the bridge with
-+ * br_vlan_get_info_rcu(egress, vid, &vinfo) whether the port member of @vid
-+ * carries BRIDGE_VLAN_INFO_UNTAGGED and offload those entries once tag push
-+ * and pop have been validated on hardware. AIROHA_FOE_IB2_PCP exists in the
-+ * FOE as well, but the offload path drops act->vlan.prio today, so the PCP
-+ * cannot be reproduced either.
++ * TODO(AN7581 tag handling): the PPE L2B template built by
++ * airoha_ppe_bridge_fdb_promote() always clears the egress VLAN fields, so
++ * only "untagged in, untagged out" can be expressed. Pushing a tag for a
++ * tagged @vid or popping one from a tagged ingress frame needs hardware
++ * validation (airoha_ppe_foe_entry_prepare() only records tags coming from
++ * FLOW_ACTION_VLAN_PUSH actions, and the driver treats FLOW_ACTION_VLAN_POP
++ * as a no-op). AIROHA_FOE_IB2_PCP exists in the FOE as well, but the offload
++ * path drops act->vlan.prio today, so the PCP cannot be reproduced either.
 + */
-+static bool airoha_ppe_fdb_vlan_is_untagged(u16 vid)
++static bool airoha_ppe_fdb_vlan_is_untagged(struct net_device *egress, u16 vid)
 +{
-+	return !vid;
++	struct bridge_vlan_info vinfo;
++
++	if (!vid)
++		return true;
++
++	if (br_vlan_get_info_rcu(egress, vid, &vinfo))
++		return false;
++
++	return vinfo.flags & BRIDGE_VLAN_INFO_UNTAGGED;
 +}
 +
 +/* Drop the L2 flows promoted from @fdb and invalidate their FOE entries.
@@ -286,7 +344,19 @@ Signed-off-by: Kitsune <km2077@foxmail.com>
 +	struct airoha_fdb_key key;
 +	struct net_device *egress;
 +	struct ethhdr *eh = eth_hdr(skb);
++	bool tagged;
++	u16 vid;
 +	int err;
++
++	/* airoha_ppe_foe_commit_entry() returns -ENODEV until the NPU has been
++	 * set up by the nft flowtable path, and that failure used to be ignored
++	 * after l2_flows had already been updated. Nothing can be offloaded
++	 * yet: leave the frame to the software bridge and count it.
++	 */
++	if (!rcu_access_pointer(ppe->eth->npu)) {
++		WRITE_ONCE(ppe->fdb_stats.no_npu, ppe->fdb_stats.no_npu + 1);
++		return;
++	}
 +
 +	/* Broadcast, multicast and unknown unicast destinations are flooded
 +	 * by the software bridge: only learned destinations are offloaded.
@@ -294,17 +364,45 @@ Signed-off-by: Kitsune <km2077@foxmail.com>
 +	if (is_multicast_ether_addr(eh->h_dest))
 +		return;
 +
-+	/* v1 leaves tagged frames to the software bridge, see
-+	 * airoha_ppe_fdb_vlan_is_untagged().
++	/* Work out the VID the bridge uses for this frame. An untagged frame is
++	 * classified into the PVID of its ingress bridge port (0 when the port
++	 * is not a VLAN-filtering bridge port); a tagged frame carries its own
++	 * VID, either in the packet or in the skb metadata when the tag was
++	 * offloaded. v1 only offloads the fully untagged case, see below.
 +	 */
-+	if (skb->protocol == htons(ETH_P_8021Q) ||
-+	    skb->protocol == htons(ETH_P_8021AD)) {
-+		WRITE_ONCE(ppe->fdb_stats.tagged, ppe->fdb_stats.tagged + 1);
++	rcu_read_lock();
++	if (skb_vlan_tag_present(skb)) {
++		vid = skb_vlan_tag_get_id(skb);
++		tagged = true;
++	} else if (skb->protocol == htons(ETH_P_8021Q) ||
++		   skb->protocol == htons(ETH_P_8021AD)) {
++		/* The tag is still in the packet: this driver does not strip it
++		 * on RX, so the frame is tagged as well.
++		 */
++		vid = 0;
++		tagged = true;
++	} else {
++		u16 pvid;
++
++		vid = 0;
++		if (!br_vlan_get_pvid_rcu(skb->dev, &pvid))
++			vid = pvid;
++		tagged = false;
++	}
++	rcu_read_unlock();
++
++	/* A tagged ingress frame needs a tag pop and a tagged egress port needs
++	 * a tag push; neither can be expressed on the PPE L2B entry yet. Leave
++	 * the frame to the software bridge, visibly.
++	 */
++	if (tagged) {
++		WRITE_ONCE(ppe->fdb_stats.vlan_rewrite,
++			   ppe->fdb_stats.vlan_rewrite + 1);
 +		return;
 +	}
 +
 +	ether_addr_copy(key.addr, eh->h_dest);
-+	key.vid = 0;
++	key.vid = vid;
 +
 +	/* airoha_ppe_foe_entry_prepare() resolves the PON GEM/T-CONT mapping
 +	 * under flow_offload_mutex. This runs in the RX path, so take the lock
@@ -318,13 +416,26 @@ Signed-off-by: Kitsune <km2077@foxmail.com>
 +
 +	fdb = rhashtable_lookup_fast(&ppe->fdb_table, &key,
 +				     airoha_fdb_table_params);
-+	if (!fdb || (fdb->flags & AIROHA_FDB_F_NO_OFFLOAD) ||
-+	    skb->dev == fdb->egress) {
-+		/* Unknown destination, tag rewriting or a frame coming from the
-+		 * egress port itself: the software bridge keeps forwarding it.
++	if (!fdb || skb->dev == fdb->egress) {
++		/* Unknown destination or a frame coming from the egress port
++		 * itself: the software bridge keeps forwarding it.
 +		 */
 +		WRITE_ONCE(ppe->fdb_stats.no_entry,
 +			   ppe->fdb_stats.no_entry + 1);
++		spin_unlock_bh(&ppe_lock);
++		goto out_unlock_mutex;
++	}
++
++	/* The key is the VID the bridge learned the destination in, so the
++	 * egress port must emit that VID untagged for the frame to need no tag
++	 * rewrite. Otherwise keep it in software, visibly.
++	 */
++	rcu_read_lock();
++	tagged = !airoha_ppe_fdb_vlan_is_untagged(fdb->egress, vid);
++	rcu_read_unlock();
++	if (tagged) {
++		WRITE_ONCE(ppe->fdb_stats.vlan_rewrite,
++			   ppe->fdb_stats.vlan_rewrite + 1);
 +		spin_unlock_bh(&ppe_lock);
 +		goto out_unlock_mutex;
 +	}
@@ -362,14 +473,15 @@ Signed-off-by: Kitsune <km2077@foxmail.com>
 +		goto out_free;
 +
 +	/* A concurrent insertion of the same (source MAC, destination MAC)
-+	 * pair wins: reuse it instead of replacing it, since
-+	 * airoha_ppe_foe_l2_flow_commit_entry() would only drop the entry
-+	 * installed by the netfilter offload path.
++	 * tuple wins: reuse it instead of replacing it. The commit path rejects
++	 * an existing entry with -EEXIST now, so this lookup only avoids the
++	 * clean failure and the software forward on the next frame.
 +	 */
 +	prev = rhashtable_lookup_fast(&ppe->l2_flows, &e->data.bridge,
 +				      airoha_l2_flow_table_params);
 +	if (prev) {
-+		airoha_ppe_foe_commit_subflow_entry(ppe, prev, hash, false);
++		err = airoha_ppe_foe_commit_subflow_entry(ppe, prev, hash,
++							  false);
 +		goto out_free;
 +	}
 +
@@ -377,13 +489,28 @@ Signed-off-by: Kitsune <km2077@foxmail.com>
 +	if (err)
 +		goto out_free;
 +
-+	airoha_ppe_foe_commit_subflow_entry(ppe, e, hash, false);
++	err = airoha_ppe_foe_commit_subflow_entry(ppe, e, hash, false);
++	if (err) {
++		/* Undo the l2_flows insertion: the destination keeps being
++		 * forwarded by the software bridge and the next frame retries.
++		 */
++		airoha_ppe_foe_remove_l2_flow(ppe, e);
++		goto out_free;
++	}
++
 +	list_add_tail(&e->fdb_node, &fdb->flows);
 +	e = NULL;
 +	WRITE_ONCE(ppe->fdb_stats.promoted, ppe->fdb_stats.promoted + 1);
 +
 +out_free:
 +	spin_unlock_bh(&ppe_lock);
++	/* Do not print under ppe_lock: the failure is only interesting for the
++	 * operator, the frame was forwarded by the software bridge anyway.
++	 */
++	if (err)
++		dev_warn_ratelimited(ppe->eth->dev,
++				     "failed to promote bridge flow to %pM: %d\n",
++				     eh->h_dest, err);
 +	kfree(e);
 +out_put:
 +	dev_put(egress);
@@ -458,8 +585,6 @@ Signed-off-by: Kitsune <km2077@foxmail.com>
 +	INIT_LIST_HEAD(&fdb->flows);
 +	fdb->key = key;
 +	fdb->egress = egress;
-+	if (!airoha_ppe_fdb_vlan_is_untagged(vid))
-+		fdb->flags |= AIROHA_FDB_F_NO_OFFLOAD;
 +
 +	spin_lock_bh(&ppe_lock);
 +
@@ -481,7 +606,7 @@ Signed-off-by: Kitsune <km2077@foxmail.com>
  static int airoha_ppe_get_entry_idle_time(struct airoha_ppe *ppe, u32 ib1)
  {
  	u32 state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, ib1);
-@@ -1705,7 +2023,10 @@ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+@@ -1705,7 +2116,10 @@ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
  		return;
  
  	ppe->foe_check_time[hash] = now;
@@ -493,7 +618,7 @@ Signed-off-by: Kitsune <km2077@foxmail.com>
  }
  
  void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr)
-@@ -1840,12 +2161,19 @@ int airoha_ppe_init(struct airoha_eth *eth)
+@@ -1840,12 +2254,19 @@ int airoha_ppe_init(struct airoha_eth *eth)
  	if (err)
  		goto error_flow_table_destroy;
  
@@ -514,12 +639,13 @@ Signed-off-by: Kitsune <km2077@foxmail.com>
  error_l2_flow_table_destroy:
  	rhashtable_destroy(&ppe->l2_flows);
  error_flow_table_destroy:
-@@ -1870,6 +2198,8 @@ void airoha_ppe_deinit(struct airoha_eth *eth)
+@@ -1870,6 +2291,9 @@ void airoha_ppe_deinit(struct airoha_eth *eth)
  
  	mutex_unlock(&flow_offload_mutex);
  
 +	airoha_ppe_bridge_fdb_flush(eth->ppe);
 +
++	rhashtable_destroy(&eth->ppe->fdb_table);
  	rhashtable_destroy(&eth->ppe->l2_flows);
  	rhashtable_destroy(&eth->flow_table);
  	debugfs_remove(eth->ppe->debugfs_dir);

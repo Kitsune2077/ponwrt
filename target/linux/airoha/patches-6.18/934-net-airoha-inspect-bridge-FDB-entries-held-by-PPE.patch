@@ -31,11 +31,11 @@ Signed-off-by: Kitsune <km2077@foxmail.com>
 ---
 ---
 diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
-index cd94f16..04d0961 100644
+index 8df3edacf..4d0b78bd2 100644
 --- a/drivers/net/ethernet/airoha/airoha_eth.h
 +++ b/drivers/net/ethernet/airoha/airoha_eth.h
-@@ -779,6 +779,12 @@ struct airoha_ppe {
- 		unsigned long tagged;   /* tagged frame, left to the bridge */
+@@ -771,6 +771,12 @@ struct airoha_ppe {
+ 		unsigned long no_npu;       /* NPU not configured, promote skipped */
  	} fdb_stats;
  
 +	/* Inspects the bridge FDB entries offloaded to the PPE, see
@@ -48,10 +48,10 @@ index cd94f16..04d0961 100644
  	u16 *foe_check_time;
  
 diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
-index 358973a..40c3732 100644
+index 78facd8d0..569b92a8f 100644
 --- a/drivers/net/ethernet/airoha/airoha_ppe.c
 +++ b/drivers/net/ethernet/airoha/airoha_ppe.c
-@@ -45,6 +45,17 @@ static const struct rhashtable_params airoha_fdb_table_params = {
+@@ -46,6 +46,17 @@ static const struct rhashtable_params airoha_fdb_table_params = {
  	.automatic_shrinking = true,
  };
  
@@ -69,10 +69,71 @@ index 358973a..40c3732 100644
  static int airoha_ppe_get_num_stats_entries(struct airoha_ppe *ppe)
  {
  	if (!IS_ENABLED(CONFIG_NET_AIROHA_FLOW_STATS))
-@@ -1570,6 +1581,113 @@ static int airoha_ppe_entry_idle_time(struct airoha_ppe *ppe,
- 	return airoha_ppe_get_entry_idle_time(ppe, e->data.ib1);
+@@ -1625,42 +1636,181 @@ airoha_ppe_foe_flow_l2_entry_update(struct airoha_ppe *ppe,
+ 	}
  }
  
+-static void airoha_ppe_foe_flow_entry_update(struct airoha_ppe *ppe,
+-					     struct airoha_flow_table_entry *e)
++static void
++airoha_ppe_foe_flow_entry_update_locked(struct airoha_ppe *ppe,
++					struct airoha_flow_table_entry *e)
+ {
+ 	struct airoha_foe_entry *hwe_p, hwe = {};
+ 
+-	spin_lock_bh(&ppe_lock);
++	lockdep_assert_held(&ppe_lock);
+ 
+ 	if (e->type == FLOW_TYPE_L2) {
+ 		airoha_ppe_foe_flow_l2_entry_update(ppe, e);
+-		goto unlock;
++		return;
+ 	}
+ 
+ 	if (e->hash == 0xffff)
+-		goto unlock;
++		return;
+ 
+ 	hwe_p = airoha_ppe_foe_get_entry_locked(ppe, e->hash);
+ 	if (!hwe_p)
+-		goto unlock;
++		return;
+ 
+ 	memcpy(&hwe, hwe_p, sizeof(*hwe_p));
+ 	if (!airoha_ppe_foe_compare_entry(e, &hwe)) {
+ 		e->hash = 0xffff;
+-		goto unlock;
++		return;
+ 	}
+ 
+ 	e->data.ib1 = hwe.ib1;
+-unlock:
+-	spin_unlock_bh(&ppe_lock);
++}
++
++/* Caller must hold ppe_lock. */
++static int airoha_ppe_entry_idle_time_locked(struct airoha_ppe *ppe,
++					     struct airoha_flow_table_entry *e)
++{
++	airoha_ppe_foe_flow_entry_update_locked(ppe, e);
++
++	return airoha_ppe_get_entry_idle_time(ppe, e->data.ib1);
+ }
+ 
+ static int airoha_ppe_entry_idle_time(struct airoha_ppe *ppe,
+ 				      struct airoha_flow_table_entry *e)
+ {
+-	airoha_ppe_foe_flow_entry_update(ppe, e);
++	int idle;
+ 
+-	return airoha_ppe_get_entry_idle_time(ppe, e->data.ib1);
++	spin_lock_bh(&ppe_lock);
++	idle = airoha_ppe_entry_idle_time_locked(ppe, e);
++	spin_unlock_bh(&ppe_lock);
++
++	return idle;
++}
++
 +/* True when at least one PPE entry promoted from @fdb has been used less
 + * than fdb_refresh_period seconds ago, i.e. when the hardware is really
 + * forwarding this destination.
@@ -104,6 +165,8 @@ index 358973a..40c3732 100644
 +{
 +	struct airoha_flow_table_entry *e;
 +
++	lockdep_assert_held(&ppe_lock);
++
 +	/* The PPE timestamps its entries in seconds, see
 +	 * airoha_ppe_get_entry_idle_time().
 +	 */
@@ -111,7 +174,8 @@ index 358973a..40c3732 100644
 +		return false;
 +
 +	list_for_each_entry(e, &fdb->flows, fdb_node) {
-+		if (airoha_ppe_entry_idle_time(ppe, e) < fdb_refresh_period)
++		if (airoha_ppe_entry_idle_time_locked(ppe, e) <
++		    fdb_refresh_period)
 +			return true;
 +	}
 +
@@ -125,10 +189,17 @@ index 358973a..40c3732 100644
 +	struct rhashtable_iter iter;
 +	struct airoha_fdb_entry *fdb;
 +	unsigned long active = 0, offloaded = 0;
-+	bool printed = false, complete = true;
++	char egress_name[IFNAMSIZ] = {};
++	u8 addr[ETH_ALEN] = {};
++	bool complete = true;
++	u16 vid = 0;
 +
-+	/* The walk can sleep, so it cannot run from airoha_ppe_check_skb()
-+	 * and it does not: this is a work item on system_wq.
++	/* The walk itself only takes the rhashtable spinlock and an RCU read
++	 * lock, it does not sleep, so it may run under ppe_lock. Doing so is
++	 * required: airoha_ppe_bridge_fdb_update() removes an entry from
++	 * ppe->fdb_table and then kfree()s it, with ppe_lock held in between,
++	 * so the RCU read lock alone does not keep fdb->flows/fdb->egress
++	 * alive for the inspect below.
 +	 *
 +	 * The table can be rehashed while this runs, because FDB events arrive
 +	 * from softirq. rhashtable_walk_next() then returns ERR_PTR(-EAGAIN)
@@ -136,6 +207,8 @@ index 358973a..40c3732 100644
 +	 * entries seen so far a second time, so the pass is abandoned instead
 +	 * and the next one covers the whole table.
 +	 */
++	spin_lock_bh(&ppe_lock);
++
 +	rhashtable_walk_enter(&ppe->fdb_table, &iter);
 +	rhashtable_walk_start(&iter);
 +
@@ -149,26 +222,34 @@ index 358973a..40c3732 100644
 +		if (!airoha_ppe_fdb_entry_is_active(ppe, fdb))
 +			continue;
 +
-+		active++;
-+		if (!printed) {
-+			dev_info_ratelimited(ppe->eth->dev,
-+					     "%s: bridge entry %pM vid %u is offloaded and in use\n",
-+					     fdb->egress->name, fdb->key.addr,
-+					     fdb->key.vid);
-+			printed = true;
++		/* Do not print under ppe_lock: copy what the message needs and
++		 * emit it after the lock is dropped.
++		 */
++		if (!active) {
++			strscpy(egress_name, fdb->egress->name,
++				sizeof(egress_name));
++			ether_addr_copy(addr, fdb->key.addr);
++			vid = fdb->key.vid;
 +		}
++		active++;
 +	}
 +
 +	rhashtable_walk_stop(&iter);
 +	rhashtable_walk_exit(&iter);
 +
-+	if (!complete)
++	spin_unlock_bh(&ppe_lock);
++
++	if (!complete) {
 +		dev_info(ppe->eth->dev,
 +			 "bridge FDB table changed during the scan, retrying next period\n");
-+	else if (active)
++	} else if (active) {
++		dev_info_ratelimited(ppe->eth->dev,
++				     "%s: bridge entry %pM vid %u is offloaded and in use\n",
++				     egress_name, addr, vid);
 +		dev_info(ppe->eth->dev,
 +			 "%lu of %lu offloaded bridge entries are in use, no refresh available\n",
 +			 active, offloaded);
++	}
 +
 +	/* Run again only when the inspection is enabled: mod_delayed_work()
 +	 * is used so that a 0 written to the module parameter stops the work
@@ -178,12 +259,10 @@ index 358973a..40c3732 100644
 +		mod_delayed_work(system_wq, &ppe->fdb_refresh_work,
 +				 round_jiffies(msecs_to_jiffies(
 +					 (unsigned long)fdb_refresh_period * 1000)));
-+}
-+
+ }
+ 
  static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
- 					   struct flow_cls_offload *f)
- {
-@@ -2170,6 +2288,12 @@ int airoha_ppe_init(struct airoha_eth *eth)
+@@ -2263,6 +2413,12 @@ int airoha_ppe_init(struct airoha_eth *eth)
  	if (err)
  		goto error_fdb_table_destroy;
  
@@ -196,7 +275,7 @@ index 358973a..40c3732 100644
  	return 0;
  
  error_fdb_table_destroy:
-@@ -2186,6 +2310,8 @@ void airoha_ppe_deinit(struct airoha_eth *eth)
+@@ -2279,6 +2435,8 @@ void airoha_ppe_deinit(struct airoha_eth *eth)
  {
  	struct airoha_npu *npu;
  
