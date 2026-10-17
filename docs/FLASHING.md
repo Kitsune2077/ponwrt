@@ -236,18 +236,27 @@ tcpdump -i pon0 -n -e 'pppoed or pppoes'
 
 按第 6 节把 2.5G 口桥给下游路由器拨号之后，光猫自己的管理地址 `192.168.1.1` 只存在于
 `br-lan` 上，下游路由器（下称「路由器」）的 WAN 口是 PPPoE，走不到这个地址。要让它对
-**路由器本身**和**路由器后面的设备**都可见，有两种做法：
+**路由器本身**和**路由器后面的设备**都可见，有三种做法：
 
 | 方案 | 需要的网线 | 光猫侧改动 | 适用场景 |
 | --- | --- | --- | --- |
 | A. 单独管理网线 | 2 根（2.5G 拨号 + 管理口互联） | 无 | 走线方便，改动最小 |
 | B. 单线复用 | 1 根（只有 WAN 那根） | 2.5G 口改成 VLAN 干线 | 不方便再拉线 |
+| C. 单线并存 + 插件 | 1 根（只有 WAN 那根） | `br-wan` 加一个管理 IP（不动桥） | 不方便再拉线、路由器装有 iStore，想省掉路由器侧手工配置（6.7.4） |
 
-两种方案在路由器侧都是同一套思路：把接光猫的那个口（方案 A）或那条 VLAN（方案 B）配成
+方案 A/B 在路由器侧是同一套思路：把接光猫的那个口（方案 A）或那条 VLAN（方案 B）配成
 独立接口，放进独立防火墙区并开 masquerade。原因是光猫上只有 `192.168.1.0/24` 的直连
 路由，回 `10.0.0.0/24` 的包会被它丢给默认网关；`masq '1'` 把下游设备的源地址改写成
 路由器在光猫网段里的地址（`192.168.1.2`），光猫直接回给路由器就够了。路由器**自己**访问
-`192.168.1.1` 用的是接口地址，不依赖 NAT。
+`192.168.1.1` 用的是接口地址，不依赖 NAT。方案 C 把路由器侧整个交给 `luci-app-ap-modem`
+插件（管理地址需换一个网段），见 6.7.4。
+
+> **注意（方案 A/B）**：路由器自己的 LAN 网段**不能也是 `192.168.1.0/24`**。否则 LAN 桥与管理接口
+> 同网段，内核的两条连接路由会产生歧义（`ping 192.168.1.1` 可能从 LAN 桥发出而不走管理
+> 接口），masquerade 也救不回来。冲突时先把路由器 LAN 改成别的网段（如 `10.0.0.1/24`、
+> `192.168.8.1/24`）再套用本节。方案 C 不受此限——它路由器侧走独立网段（下文以
+> `192.168.9.0/24` 为例），LAN 与 `192.168.1.0/24` 同网段也不冲突，只是同样不能与管理
+> 网段撞车。
 
 #### 6.7.1 方案 A：单独一根管理网线
 
@@ -328,7 +337,12 @@ PPPoE 完全不受影响；光猫的管理网打成 VLAN tag 走同一根网线�
   （例如 OLT 侧带 tag `3114`、2.5G 口剥 tag 给下游拨号），脚本只做加法，不会动它；
   若运营商桥还没开 VLAN 过滤，脚本会补一条 untagged 透传条目（`--isp-vid`，默认 2）；
 - 新增管理 VLAN：2.5G 口带 tag、千兆口不带 tag（所以**插在千兆口上的电脑行为完全不变**）；
-- 管理 IP 从原来的桥挪到新桥的 VLAN 子接口（如 `br-wan.2100`）上，地址不变。
+- 管理 IP 从原来的桥挪到新桥的 VLAN 子接口（如 `br-wan.2100`）上，地址不变；
+- 若光猫还在**出厂状态**（`wan` 接口还直接挂在 `pon0` 上、没建独立运营商桥），脚本会把
+  `pon0` 并进管理桥，并把 `wan` 接口改成挂桥上的无协议接口、删除 `wan6`（等效 6.2 的
+  ②③）——不这么做 `pon0` 会被接口和桥同时占用，netifd 报 device in use。此路径生成的
+  管理子接口叫 `br-lan.<VID>`；更稳妥的做法仍是先按第 6 节建好 `br-wan` 再跑脚本，
+  结果与上文示例一致。
 
 以 FiberHome HG5382A（OLT 带 tag 3114，2.5G 口负责剥 tag 给下游 PPPoE）为例，脚本跑完后
 `/etc/config/network` 里是这样：
@@ -442,7 +456,7 @@ nft list chain inet fw4 srcnat | grep 2100   # 会跳转到 srcnat_modem
 ```
 
 光猫侧可以确认 VLAN 归属（`bridge` 命令随 iproute2 一起装，没有该命令时看
-`ip -br addr show br-lan.2100` 有没有地址即可）：
+`ip -br addr show br-wan.2100` 有没有地址即可，桥名以脚本输出的实际名称为准）：
 
 ```sh
 bridge vlan show               # 2.5G 口应同时有 untagged 的 VLAN 2 和 tagged 的 VLAN 2100
@@ -465,7 +479,7 @@ nft list chain inet fw4 srcnat_modem
 ```
 
 方案 B 里如果路由器自己能通、下游设备不通，多半是 masquerade 或 `lan → modem` 转发没
-生效；如果两边都不通，先在光猫上确认 `br-lan.2100` 有地址、2.5G 口是 UP，再确认两端
+生效；如果两边都不通，先在光猫上确认 `br-wan.2100` 有地址、2.5G 口是 UP，再确认两端
 VLAN 号一致（`uci show network | grep bridge-vlan`）。
 
 方案 A 里 `carrier` 为 `0` 时先查网线两端，再回光猫确认那个口还在 `br-lan` 里：
@@ -507,6 +521,209 @@ uci commit network && /etc/init.d/network reload
 
 这些改动都在路由器自己的 `/etc/config/network`、`/etc/config/firewall` 里，属于
 sysupgrade 保留范围。
+
+#### 6.7.4 方案 C：单线并存 + `luci-app-ap-modem` 插件（路由器侧免配置）
+
+[iStore 仓库](https://github.com/linkease/openwrt-app-actions/tree/main/applications/luci-app-ap-modem)
+的 `luci-app-ap-modem`（jjm2473 作）解决的是另一类问题：目标网段在链路上**已经 untagged
+可达**，只是路由器没有通往它的路由和 NAT。它只在路由器 WAN 网卡上再挂一个静态 IP（放进
+现有 `wan` 区蹭 masquerade），**不解 VLAN tag、不碰 `network.wan`**——PPPoE 帧是独立的
+ethertype，与网卡上的 IP 天然并存，拨号完全不受影响。
+
+按第 6 节桥接后 `br-wan` 是纯二层桥、没有 IP，那根线上只有运营商二层，插件的前提并不
+成立，所以光猫侧仍要做一个**比方案 B 小得多的改动**：给 `br-wan` 加一个管理 IP，让管理
+网以 untagged 形式与 PPPoE 同线并存。网段必须换新的（下文以 `192.168.9.0/24` 为例）：
+`br-lan` 已占用 `192.168.1.0/24`，光猫上两个接口同网段会产生路由歧义（道理同上文对
+路由器 LAN 的警告）。
+
+```
+                     ┌── untagged PPPoE ──► 运营商二层（不变）
+光猫 br-wan ◄══ 一根网线 ══► 路由器 eth1
+   └─ 新增管理 IP 192.168.9.1       ├─ pppoe-wan：照常拨号（插件不碰）
+      （与 PPPoE 同线 untagged 并存） └─ 插件建的 vap_wan = 192.168.9.254（蹭 wan 区 masq）
+```
+
+**光猫侧**（SSH 进光猫执行；桥名不是 `br-wan` 时按 `uci show network` 的实际输出改）。
+先用 `uci show network | grep bridge-vlan` 判断：按 6.4 做过 tag↔untag（如 OLT tag
+3114）走情况 ②，没做过走情况 ①。
+
+情况 ①（运营商流量 untagged、桥未开 VLAN 过滤）：管理 IP 直接挂桥上：
+
+```sh
+uci set network.mgmtwan=interface
+uci set network.mgmtwan.proto='static'
+uci set network.mgmtwan.device='br-wan'
+uci set network.mgmtwan.ipaddr='192.168.9.1'
+uci set network.mgmtwan.netmask='255.255.255.0'
+uci set network.mgmtwan.defaultroute='0'
+```
+
+情况 ②（OLT 带 tag、已按 6.4 配好 `bridge-vlan` 3114 = `pon0:t` + 2.5G 口 `u*`）：线上
+untagged 的流量在桥内属于 VLAN 3114，IP 挂在 `br-wan` 本体会落在默认 VLAN 1 里、从线上
+够不着，必须挂到该 VLAN 的子接口——与 6.7.2 脚本生成 `br-wan.2100` 的模式完全相同，
+原有的 `bridge-vlan` 3114 原样保留、无需改动：
+
+```sh
+uci set network.mgmtdev=device
+uci set network.mgmtdev.name='br-wan.3114'
+uci set network.mgmtdev.type='vlan'
+uci set network.mgmtdev.ifname='br-wan'
+uci set network.mgmtdev.vid='3114'
+
+uci set network.mgmtwan=interface
+uci set network.mgmtwan.proto='static'
+uci set network.mgmtwan.device='br-wan.3114'
+uci set network.mgmtwan.ipaddr='192.168.9.1'
+uci set network.mgmtwan.netmask='255.255.255.0'
+uci set network.mgmtwan.defaultroute='0'
+```
+
+**从方案 B 迁移过来**（已按 6.7.2 跑过单线复用脚本、管理 IP 在 `br-wan.2100` 上的机器）：
+直接删 2100 会让千兆口失去管理入口，按「先建新路、再拆旧路」的顺序做，每一步都至少保有
+一个可用入口（下述顺序实测可用）：
+
+① 光猫：先按情况 ② 加 `mgmtwan` —— `192.168.9.1` 立即可用，之后全程兜底；
+
+② 路由器：按下文启用插件（旧配置还在也不冲突，插件用的是新网段），再删掉方案 B 的
+手工配置：
+
+```sh
+uci -q delete network.modem          # eth1.2100 上的 192.168.1.2 静态接口
+uci -q delete network.modemvlan      # eth1.2100 VLAN 设备
+# 删 modem 防火墙区与 lan→modem 转发（编号以 uci show firewall 实际输出为准）
+uci -q delete firewall.@zone[2]
+uci -q delete firewall.@forwarding[1]
+uci commit network && uci commit firewall
+/etc/init.d/network reload && /etc/init.d/firewall reload
+```
+
+③ 光猫：拆 2100，并把千兆口的管理 IP 安置到 **VLAN 1 子接口**上：
+
+```sh
+# 删 vid 2100 的 bridge-vlan 条目与 br-wan.2100 设备段（段名可能是 mgmtvlan 或
+# singlewire，以 uci show network 实际输出为准）
+i=0
+while uci -q get network.@bridge-vlan[$i] >/dev/null; do
+	[ "$(uci -q get network.@bridge-vlan[$i].vlan)" = "2100" ] && uci -q delete "network.@bridge-vlan[$i]" && break
+	i=$((i+1))
+done
+uci -q delete network.mgmtvlan
+
+# 千兆口改走 VLAN 1（条目 + 子接口），lan 挂到子接口上
+uci add network bridge-vlan
+uci set network.@bridge-vlan[-1].device='br-wan'
+uci set network.@bridge-vlan[-1].vlan='1'
+uci add_list network.@bridge-vlan[-1].ports='lan2:u*'
+uci add_list network.@bridge-vlan[-1].ports='lan3:u*'
+uci add_list network.@bridge-vlan[-1].ports='lan4:u*'
+uci set network.lanvlan=device
+uci set network.lanvlan.name='br-wan.1'
+uci set network.lanvlan.type='vlan'
+uci set network.lanvlan.ifname='br-wan'
+uci set network.lanvlan.vid='1'
+uci set network.lan.device='br-wan.1'
+
+uci commit network
+/etc/init.d/network reload
+```
+
+迁移后千兆口行为不变：插电脑仍可打开 `http://192.168.1.1/`、自动获取 DHCP。可用
+`bridge vlan show` 核对——`lan2/3/4` 应为 `1 PVID Egress Untagged`，`lan1` 仍为
+`3114 PVID Egress Untagged`。
+
+> **注意（从方案 B 迁移）**：下面两个坑都实测踩过，配错的症状酷似硬件故障，动手前先看：
+>
+> - **`lan` 的 IP 不能挂回 `br-wan` 本体**。桥开着 `vlan_filtering` 且存在 `bridge-vlan`
+>   条目时，各 VLAN 送往本机协议栈的帧是带 tag 的，只有对应 vid 的**子接口**收得到；
+>   IP 挂在桥本体上时千兆口完全不通——下游 ARP 一直 `Incomplete`、DHCP 无响应、抓包
+>   只见发不见收，而光猫桥的收包统计照常增长，非常像网卡/链路单向故障。方案 B 的
+>   `br-wan.2100`、方案 C 的 `br-wan.3114` 一直正常，正因为它们都是子接口；千兆口
+>   管理 IP 放 `br-wan.1` 与二者同构。
+> - **`br-wan` 会被先声明的接口抢占**。`wan`（proto none 占位接口）的 `device` 仍是
+>   `br-wan` 时，若把 `lan.device` 也指到 `br-wan`，netifd 会把桥判给 `wan`、`lan`
+>   一直起不来（`ubus call network.interface dump` 里 lan 没有 IPv4 地址）。把 `lan`
+>   挂到 `br-wan.1` 子接口即可避开；若坚持挂桥本体，必须先
+>   `uci -q delete network.wan.device`。
+
+防火墙（两种情况相同）：这个 IP 活在运营商广播域里（tag 场景下就是同 OLT 的用户 VLAN，
+理论上其它用户可达），**不要**把它并进 `lan` 区，而是单独建区、`input` 收紧为 `REJECT`，
+只放行 NAT 后源地址为 `192.168.9.254` 的流量——路由器自己和经过 masquerade 的下游设备
+源地址都是它：
+
+```sh
+uci add firewall zone
+uci set firewall.@zone[-1].name='mgmtwan'
+uci set firewall.@zone[-1].input='REJECT'
+uci set firewall.@zone[-1].output='ACCEPT'
+uci set firewall.@zone[-1].forward='REJECT'
+uci add_list firewall.@zone[-1].network='mgmtwan'
+
+# 只允许路由器（含经其 NAT 的下游设备）访问管理端口
+uci add firewall rule
+uci set firewall.@rule[-1].name='Allow-mgmt-from-router'
+uci set firewall.@rule[-1].src='mgmtwan'
+uci set firewall.@rule[-1].src_ip='192.168.9.254/32'
+uci set firewall.@rule[-1].proto='tcp'
+uci set firewall.@rule[-1].dest_port='22 80 443'
+uci set firewall.@rule[-1].target='ACCEPT'
+
+# 方便排错的 ICMP 放行（可选）
+uci add firewall rule
+uci set firewall.@rule[-1].name='Allow-mgmt-ping'
+uci set firewall.@rule[-1].src='mgmtwan'
+uci set firewall.@rule[-1].src_ip='192.168.9.254/32'
+uci set firewall.@rule[-1].proto='icmp'
+uci set firewall.@rule[-1].icmp_type='echo-request'
+uci set firewall.@rule[-1].target='ACCEPT'
+
+uci commit network && uci commit firewall
+/etc/init.d/network reload && /etc/init.d/firewall reload
+```
+
+**路由器侧**全部交给插件：
+
+1. iStore 应用市场或 `opkg install luci-app-ap-modem` 安装；
+2. LuCI → 网络 → **Access AP / Modem**：勾选 **Enable**，在 **WAN** 标签页的「Virtual
+   IP」填 `192.168.9.254`（**LAN 标签页留空**——那是给挂在路由器 LAN 下、管理 IP 在其它
+   网段的 AP 用的），保存并应用；
+3. 插件依赖 `wan` 区已开 masquerade（OpenWrt 默认开启），可用
+   `uci show firewall | grep masq` 确认。
+
+插件在每次开机/配置重载时按 `/etc/config/ap_modem` 自动生成并应用上述网络配置，取消
+Enable 或 `/etc/init.d/ap_modem stop` 即自动清理。它要求路由器 `lan` 设备名为 `br-lan`、
+`wan` 配置了 `device`（GL-MT5000 等原版配置均满足）。
+
+验证（路由器上）：
+
+```sh
+ip -br addr show eth1          # 应看到 192.168.9.254/24（插件的 vap_wan）
+ip -br addr show pppoe-wan     # PPPoE 仍在线：上网不受影响
+ping -c 2 192.168.9.1          # 路由器自己能通
+curl -sI http://192.168.9.1/   # 能取到光猫 LuCI 的响应头
+```
+
+然后任意下游设备打开 `http://192.168.9.1/` 即可。
+
+注意事项：
+
+- 那根线上可达的管理地址是 **`192.168.9.1` 而非 `192.168.1.1`**（同一个 LuCI、两个
+  入口）；千兆口插电脑仍是 `192.168.1.1`，行为不变。若一定要在线上直达 `192.168.1.1`，
+  只能回方案 B——插件不解 VLAN tag；
+- 隔离性不如方案 B：管理 IP 挂在运营商广播域内，靠上面的源地址限制兜底；方案 B 的独立
+  管理 VLAN 与运营商域完全隔离，安全性更好。本方案换来的是路由器侧零手工配置、光猫侧
+  只加一个 IP；
+- 光猫侧改动**不碰桥的端口成员**（从方案 B 迁移会额外增删 `bridge-vlan` 条目），配错最
+  多少一个入口，不会像方案 B 那样有失去全部有线管理入口的风险。回滚：`uci delete
+  network.mgmtwan`（情况 ② 再执行 `uci delete network.mgmtdev`），删掉 `mgmtwan` 区与
+  两条规则，重载 network/firewall 即可；从方案 B 迁移过的机器再删 `lanvlan` 与 vid 1
+  的 `bridge-vlan` 条目、把 `lan.device` 指回 `br-wan.2100` 并按 6.7.2 重建 2100 条目，
+  即完整回到方案 B；
+- 路由器 LAN 网段比方案 A/B 宽松：即使 LAN 也是 `192.168.1.0/24` 也不冲突（路由器侧
+  管理网段是 `192.168.9.0/24`），但**不能**把 LAN 设成 `192.168.9.0/24`——插件会自动
+  跳过与 LAN 重叠的虚拟 IP，导致配置不生效；
+- 两端改动分别落在光猫的 `/etc/config/network`、`/etc/config/firewall` 与路由器的
+  `/etc/config/ap_modem`，均属 sysupgrade 保留范围（路由器侧的网络配置由插件每次开机
+  重新生成，无需手工持久化）。
 
 ## 7. 救砖
 

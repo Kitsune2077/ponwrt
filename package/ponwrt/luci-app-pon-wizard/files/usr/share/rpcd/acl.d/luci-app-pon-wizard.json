@@ -1,0 +1,15 @@
+{
+	"luci-app-pon-wizard": {
+		"description": "Grant access to the PON provisioning wizard",
+		"read": {
+			"uci": [ "ponwizard", "network", "firewall" ],
+			"file": {
+				"/usr/libexec/pon-wizard-apply": [ "exec" ],
+				"/usr/libexec/pon-wizard-apply *": [ "exec" ]
+			}
+		},
+		"write": {
+			"uci": [ "ponwizard" ]
+		}
+	}
+}
