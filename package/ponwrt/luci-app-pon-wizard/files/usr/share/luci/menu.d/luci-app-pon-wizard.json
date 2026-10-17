@@ -1,0 +1,14 @@
+{
+	"admin/network/pon/wizard": {
+		"title": "Wizard",
+		"order": 15,
+		"action": {
+			"type": "view",
+			"path": "pon/wizard"
+		},
+		"depends": {
+			"acl": [ "luci-app-pon-wizard" ],
+			"uci": { "ponwizard": true }
+		}
+	}
+}

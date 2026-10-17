@@ -1,0 +1,588 @@
+#!/bin/sh
+# PonWrt 接入向导后端：把 /etc/config/ponwizard 的声明式配置收敛成真实的
+# network/firewall 配置（FLASHING.md 第 6 节桥接 + 6.4 运营商 VLAN + 6.7 管理访问）。
+#
+# 设计要点：
+#   * status 子命令从「实际配置」反推当前状态——即使方案 B/C 是按文档手工（或用
+#     ponwrt-single-wire.sh）配的，也能被识别并在页面上预勾选；
+#   * apply 永远走「先中性化已存在的管理访问，再按声明重建」的收敛流程，
+#     生成的段名与 FLASHING.md 手工命令完全一致（mgmtdev/mgmtwan/mgmtwan 区/
+#     Allow-mgmt-* 规则），手工配过的机器可被无感接管；
+#   * 桥接步骤只做加法：勾选后确保 br-wan 存在，取消勾选不会自动拆桥（拆桥
+#     需要重建路由模式，语义不明确，留给手工）；
+#   * apply 默认武装 10 分钟自动回滚（备份 network+firewall 到 /root），
+#     confirm 确认保留，revert 立即回滚。
+#
+# 用法：
+#   pon-wizard-apply status            # 输出检测状态 + 声明 + 是否同步（JSON）
+#   pon-wizard-apply plan              # 只打印将要做的改动
+#   pon-wizard-apply apply [--dry-run] # 按 /etc/config/ponwizard 收敛
+#   pon-wizard-apply confirm           # 确认保留（解除自动回滚）
+#   pon-wizard-apply revert            # 立即回滚到最近一次 apply 前的备份
+#
+# 环境变量均可覆盖，便于离线自测（CONFIG_DIR 指向 fixture 目录、init 脚本指
+# 向 /bin/true 等）。
+
+CONFIG_DIR="${CONFIG_DIR:-/etc/config}"
+BACKUP_DIR="${BACKUP_DIR:-/root}"
+KEEP_MARK="${KEEP_MARK:-/tmp/ponwizard-keep}"
+STATE="${STATE:-$BACKUP_DIR/ponwizard.state}"
+TIMER_PID_FILE="${TIMER_PID_FILE:-/tmp/ponwizard-timer.pid}"
+NETWORK_INIT="${NETWORK_INIT:-/etc/init.d/network}"
+FIREWALL_INIT="${FIREWALL_INIT:-/etc/init.d/firewall}"
+TIMEOUT="${TIMEOUT:-600}"
+
+WIZCFG="ponwizard"
+
+msg() { echo "[pon-wizard] $*"; }
+die() { echo "[pon-wizard] 错误: $*" >&2; exit 1; }
+
+uci() { command uci -c "$CONFIG_DIR" "$@"; }
+uget() { uci -q get "$1" 2>/dev/null || true; }
+udel() { uci -q delete "$1" 2>/dev/null || true; }
+
+json_bool() { if [ "$1" = "1" ]; then echo true; else echo false; fi; }
+json_str() { if [ -n "$1" ]; then echo "\"$1\""; else echo null; fi; }
+json_arr() {
+	local out="" p
+	for p in $1; do out="$out\"$p\","; done
+	if [ -n "$out" ]; then echo "[${out%,}]"; else echo "[]"; fi
+}
+
+# ---------- 声明（/etc/config/ponwizard） ----------
+d_bridged()   { uget "$WIZCFG.config.bridged" || echo 0; }
+d_port25()    { uget "$WIZCFG.config.port25"; }
+d_vlan_en()   { uget "$WIZCFG.config.wan_vlan_enabled" || echo 0; }
+d_vlan()      { uget "$WIZCFG.config.wan_vlan"; }
+d_scheme()    { uget "$WIZCFG.config.mgmt_scheme" || echo none; }
+d_mgmt_vlan() { uget "$WIZCFG.config.mgmt_vlan" || echo 2100; }
+d_mgmt_ip()   { uget "$WIZCFG.config.mgmt_ip" || echo 192.168.9.1; }
+d_mgmt_rtr()  { uget "$WIZCFG.config.mgmt_router_ip" || echo 192.168.9.254; }
+
+# ---------- 实际状态检测 ----------
+# 检测结果放在这些全局变量里：
+#   D_BRIDGED D_PONSEC D_PONNAME D_PONPORT D_PORT25 D_GBE
+#   D_ISPVID  D_SCHEME(B/C/none) D_MGMTVID D_MGMTIP D_MGMTMASK D_MGMDDEV D_MGMTRTR
+device_sections() { uci show network 2>/dev/null | sed -n "s/^network\.\([^.]*\)=device$/\1/p"; }
+bridgevlan_sections() { uci show network 2>/dev/null | sed -n "s/^network\.\([^.]*\)=bridge-vlan$/\1/p"; }
+
+# 匿名段删除必须「每次重新扫描」：删掉一段后 @type[N] 的索引会整体前移，
+# 按旧快照继续删会删错对象。下面的两个 helper 都删到没有匹配为止。
+del_matching_bv() {   # $1 = 端口 token（如 pon0:t / lan1:t），$2 = vid（可空）
+	local s found
+	while :; do
+		found=""
+		for s in $(bridgevlan_sections); do
+			[ "$(uget network.$s.device)" = "$D_PONNAME" ] || continue
+			[ -z "${2:-}" ] || [ "$(uget network.$s.vlan)" = "$2" ] || continue
+			case " $(uget network.$s.ports) " in *" $1 "*) found="$s"; break ;; esac
+		done
+		[ -n "$found" ] || break
+		udel "network.$found"
+	done
+}
+
+del_fw_zone() {   # $1 = 区名（连同引用它的规则一起删）
+	local found rs
+	while :; do
+		found=""
+		for rs in $(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.]*\)=rule$/\1/p"); do
+			[ "$(uget firewall.$rs.src)" = "$1" ] && { found="$rs"; break; }
+		done
+		[ -n "$found" ] || break
+		udel "firewall.$found"
+	done
+	for rs in $(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.]*\)=zone$/\1/p"); do
+		if [ "$(uget firewall.$rs.name)" = "$1" ]; then udel "firewall.$rs"; fi
+	done
+}
+
+sec_ports() { uget "network.$1.ports"; }
+sec_name()  { uget "network.$1.name"; }
+
+detect() {
+	D_BRIDGED=0; D_PONSEC=""; D_PONNAME=""; D_PONPORT=""; D_PORT25=""
+	D_GBE=""; D_ISPVID=""; D_SCHEME="none"; D_MGMTVID=""
+	D_MGMTIP=""; D_MGMTMASK=""; D_MGMTDEV=""; D_MGMTRTR=""
+
+	# 找端口里含 pon* 的桥（运营商桥）
+	local s p ports
+	for s in $(device_sections); do
+		ports="$(sec_ports "$s")"
+		for p in $ports; do
+			case "$p" in pon*)
+				D_PONSEC="$s"; D_PONNAME="$(sec_name "$s")"; D_PONPORT="$p"
+				break 2
+				;;
+			esac
+		done
+	done
+	[ -n "$D_PONNAME" ] || return 0
+
+	# 2.5G 口 = 运营商桥里除 pon 外的第一个口（声明值兜底）
+	for p in $(sec_ports "$D_PONSEC"); do
+		case "$p" in pon*) ;; *) D_PORT25="$p"; break ;; esac
+	done
+	[ -n "$D_PORT25" ] || D_PORT25="$(d_port25)"
+
+	# 桥接判定：wan 接口挂在该桥上且 proto=none（FLASHING 6.2 ③）。
+	# 放宽：wan 是空段（无 device/proto，等价 proto=none）也算已桥接——
+	# 只要 pon 桥本身带非 pon 成员口，透传拓扑已经成立。
+	_wdev="$(uget network.wan.device)"
+	_wproto="$(uget network.wan.proto)"
+	if { [ "$_wdev" = "$D_PONNAME" ] || [ -z "$_wdev" ]; } \
+	   && { [ -z "$_wproto" ] || [ "$_wproto" = "none" ]; } \
+	   && [ -n "$D_PORT25" ]; then
+		D_BRIDGED=1
+	fi
+
+	# 运营商 tag：该桥上带 pon:t 的 bridge-vlan（6.4 签名）
+	local vid ptxt
+	for s in $(bridgevlan_sections); do
+		[ "$(uget network.$s.device)" = "$D_PONNAME" ] || continue
+		ptxt="$(uget network.$s.ports)"
+		case " $ptxt " in *" $D_PONPORT:t "*)
+			D_ISPVID="$(uget network.$s.vlan)"
+			break
+			;;
+		esac
+	done
+
+	# 管理访问：先看方案 B（lan 接口挂在 <桥>.<vid> 且该 vid 里 2.5G 口带 tag）
+	local landev
+	landev="$(uget network.lan.device)"
+	case "$landev" in
+		"$D_PONNAME".*)
+			D_MGMTVID="${landev##*.}"
+			for s in $(bridgevlan_sections); do
+				[ "$(uget network.$s.device)" = "$D_PONNAME" ] || continue
+				[ "$(uget network.$s.vlan)" = "$D_MGMTVID" ] || continue
+				ptxt="$(uget network.$s.ports)"
+				case " $ptxt " in *" $D_PORT25:t "*)
+					D_SCHEME="B"
+					for p in $ptxt; do
+						case "$p" in *:u*) D_GBE="$D_GBE ${p%:u*}" ;; esac
+					done
+					D_GBE="$(echo $D_GBE)"
+					;;
+				esac
+			done
+			;;
+	esac
+
+	# 再看方案 C：mgmtwan 接口挂在 <桥> 或 <桥>.<vid> 上（6.7.4 签名，含手工配置）
+	if [ "$D_SCHEME" != "B" ] && [ -n "$(uget network.mgmtwan)" ]; then
+		local mdev
+		mdev="$(uget network.mgmtwan.device)"
+		case "$mdev" in
+			"$D_PONNAME"|"$D_PONNAME".*)
+				D_SCHEME="C"; D_MGMTDEV="$mdev"
+				D_MGMTIP="$(uget network.mgmtwan.ipaddr)"
+				D_MGMTMASK="$(uget network.mgmtwan.netmask)"
+				# 路由器虚拟 IP 从放行规则里读（允许缺省）
+				local rs
+				for rs in $(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.]*\)=rule$/\1/p"); do
+					if [ "$(uget firewall.$rs.name)" = "Allow-mgmt-from-router" ]; then
+						D_MGMTRTR="$(uget firewall.$rs.src_ip)"
+						D_MGMTRTR="${D_MGMTRTR%/32}"
+						break
+					fi
+				done
+				;;
+		esac
+	fi
+
+	# 非 B 状态下的千兆口 = br-lan 的端口；没有 br-lan（所有口都在 pon 桥里，
+	# 如 HG5382A 的 VLAN1 管理变体）时回退为 pon 桥成员去掉 pon 口和 2.5G 口
+	if [ -z "$D_GBE" ]; then
+		for s in $(device_sections); do
+			if [ "$(sec_name "$s")" = "br-lan" ]; then
+				D_GBE="$(sec_ports "$s")"
+				break
+			fi
+		done
+	fi
+	if [ -z "$D_GBE" ]; then
+		local q
+		for q in $(sec_ports "$D_PONSEC"); do
+			case "$q" in "$D_PONPORT"|"$D_PORT25") ;; *) D_GBE="$D_GBE $q" ;; esac
+		done
+		D_GBE="$(echo $D_GBE)"
+	fi
+}
+
+sync_state() {
+	# 声明与实际是否一致（桥接是单向语义，不参与比对）
+	local ok=1
+	if [ "$(d_vlan_en)" = "1" ]; then
+		[ -n "$D_ISPVID" ] && [ "$(d_vlan)" = "$D_ISPVID" ] || ok=0
+	else
+		[ -z "$D_ISPVID" ] || ok=0
+	fi
+	local ds="$(d_scheme)"
+	if [ "$ds" = "$D_SCHEME" ]; then
+		case "$ds" in
+			B) [ "$(d_mgmt_vlan)" = "$D_MGMTVID" ] || ok=0 ;;
+			C) [ "$(d_mgmt_ip)" = "$D_MGMTIP" ] && [ "$(d_mgmt_rtr)" = "$D_MGMTRTR" ] || ok=0 ;;
+		esac
+	else
+		ok=0
+	fi
+	echo "$ok"
+}
+
+cmd_status() {
+	local mgmt
+	case "${D_SCHEME:-none}" in
+		B) mgmt="{\"scheme\":\"B\",\"vid\":$(json_str "$D_MGMTVID")}" ;;
+		C) mgmt="{\"scheme\":\"C\",\"ip\":$(json_str "$D_MGMTIP"),\"mask\":$(json_str "$D_MGMTMASK"),\"router\":$(json_str "$D_MGMTRTR"),\"parent\":$(json_str "$D_MGMTDEV")}" ;;
+		*) mgmt="{\"scheme\":\"none\"}" ;;
+	esac
+
+	local armed=false remaining=0
+	if [ -f "$TIMER_PID_FILE" ] && kill -0 "$(cat "$TIMER_PID_FILE" 2>/dev/null)" 2>/dev/null; then
+		armed=true
+		if [ -f "$STATE" ]; then
+			. "$STATE"
+			remaining=$(( ${APPLY_TS:-0} + ${APPLY_TIMEOUT:-0} - $(date +%s) ))
+			[ "$remaining" -lt 0 ] && remaining=0
+		fi
+	fi
+
+	cat <<-EOF
+	{
+	 "script_version": 1,
+	 "bridged": $(json_bool "$D_BRIDGED"),
+	 "pon_bridge": $(json_str "$D_PONNAME"),
+	 "pon_port": $(json_str "$D_PONPORT"),
+	 "port25": $(json_str "$D_PORT25"),
+	 "gbe_ports": $(json_arr "${D_GBE:-}"),
+	 "isp_vid": $(json_str "$D_ISPVID"),
+	 "mgmt": $mgmt,
+	 "declared": {
+	  "bridged": $(json_bool "$(d_bridged)"),
+	  "port25": $(json_str "$(d_port25)"),
+	  "wan_vlan_enabled": $(json_bool "$(d_vlan_en)"),
+	  "wan_vlan": $(json_str "$(d_vlan)"),
+	  "mgmt_scheme": $(json_str "$(d_scheme)"),
+	  "mgmt_vlan": $(json_str "$(d_mgmt_vlan)"),
+	  "mgmt_ip": $(json_str "$(d_mgmt_ip)"),
+	  "mgmt_router_ip": $(json_str "$(d_mgmt_rtr)")
+	 },
+	 "in_sync": $(json_bool "$(sync_state)"),
+	 "timer": {"armed": $armed, "remaining": $remaining}
+	}
+	EOF
+}
+
+# ---------- 中性化：清除已存在的管理访问（B/C，含手工配置的签名段） ----------
+neutralize_mgmt() {
+	local s p ports landev
+
+	if [ "$D_SCHEME" = "B" ]; then
+		# 删除管理 bridge-vlan、singlewire 设备段，把 lan 接口和千兆口收回 br-lan
+		del_matching_bv "$D_PORT25:t" "$D_MGMTVID"
+		udel network.singlewire
+		# 千兆口从运营商桥移回 br-lan
+		local keep=""
+		for p in $(sec_ports "$D_PONSEC"); do
+			case " $D_GBE " in *" $p "*) ;; *) keep="$keep $p" ;; esac
+		done
+		udel "network.$D_PONSEC.ports"
+		for p in $keep; do uci add_list "network.$D_PONSEC.ports=$p"; done
+		uci set network.lan.device='br-lan'
+		# 重建 br-lan 设备段
+		local lansec=""
+		for s in $(device_sections); do
+			[ "$(sec_name "$s")" = "br-lan" ] && lansec="$s" && break
+		done
+		if [ -z "$lansec" ]; then
+			uci set network.lanbr=device
+			uci set network.lanbr.name='br-lan'
+			uci set network.lanbr.type='bridge'
+			lansec=lanbr
+		fi
+		udel "network.$lansec.ports"
+		for p in $D_GBE; do uci add_list "network.$lansec.ports=$p"; done
+		msg "已中性化方案 B（管理 VLAN $D_MGMTVID）"
+	fi
+
+	if [ "$D_SCHEME" = "C" ]; then
+		udel network.mgmtwan
+		udel network.mgmtdev
+		del_fw_zone mgmtwan
+		msg "已中性化方案 C（管理 IP $D_MGMTIP）"
+	fi
+}
+
+# ---------- 按声明重建 ----------
+ensure_bridged() {
+	[ "$(d_bridged)" = "1" ] || return 0
+	[ "$D_BRIDGED" = "1" ] && return 0
+
+	local p25="$(d_port25)"
+	[ -n "$p25" ] || die "无法推断 2.5G 口，请在向导页 port25 里指定（先 ip -br link 确认）"
+
+	# 从 br-lan 摘出 2.5G 口（不允许把 br-lan 摘空）
+	local lansec="" s rest=""
+	for s in $(device_sections); do
+		[ "$(sec_name "$s")" = "br-lan" ] && lansec="$s" && break
+	done
+	[ -n "$lansec" ] || die "找不到 br-lan 设备段"
+	for p in $(sec_ports "$lansec"); do
+		[ "$p" = "$p25" ] || rest="$rest $p"
+	done
+	rest="$(echo $rest)"
+	[ -n "$rest" ] || die "拒绝执行：把 $p25 移出后 br-lan 将没有任何管理口"
+
+	udel "network.$lansec.ports"
+	for p in $rest; do uci add_list "network.$lansec.ports=$p"; done
+
+	# 建纯二层桥（若已有运营商桥则只补端口）
+	if [ -n "$D_PONSEC" ]; then
+		case " $(sec_ports "$D_PONSEC") " in *" $p25 "*) ;; *)
+			uci add_list "network.$D_PONSEC.ports=$p25" ;;
+		esac
+	else
+		uci set network.brwan=device
+		uci set network.brwan.name='br-wan'
+		uci set network.brwan.type='bridge'
+		uci add_list network.brwan.ports='pon0'
+		uci add_list "network.brwan.ports=$p25"
+	fi
+
+	uci set "network.wan.device=${D_PONNAME:-br-wan}"
+	uci set network.wan.proto='none'
+	udel network.wan6
+	D_BRIDGED=1; D_PORT25="$p25"
+	[ -n "$D_PONNAME" ] || { D_PONSEC=brwan; D_PONNAME=br-wan; D_PONPORT=pon0; }
+	msg "已确保 2.5G 桥接（$D_PONNAME = $D_PONPORT + $p25，wan proto=none）"
+}
+
+apply_wan_vlan() {
+	[ -n "$D_PONSEC" ] || die "未桥接且找不到运营商桥：请先在向导里勾选桥接（或先按 FLASHING 6.2 手工建桥）"
+	if [ "$(d_vlan_en)" = "1" ]; then
+		local vid="$(d_vlan)"
+		case "$vid" in ''|*[!0-9]*) die "wan_vlan 需要 1..4094 的数字" ;; esac
+		[ "$vid" -ge 1 ] && [ "$vid" -le 4094 ] || die "wan_vlan 超出范围"
+		uci set "network.$D_PONSEC.vlan_filtering"='1'
+		# 替换掉已有的 pon:t 签名条目（换 VLAN 时）
+		del_matching_bv "$D_PONPORT:t" ""
+		uci add network bridge-vlan >/dev/null
+		uci set "network.@bridge-vlan[-1].device=$D_PONNAME"
+		uci set "network.@bridge-vlan[-1].vlan=$vid"
+		uci add_list "network.@bridge-vlan[-1].ports=$D_PONPORT:t"
+		uci add_list "network.@bridge-vlan[-1].ports=$D_PORT25:u*"
+		D_ISPVID="$vid"
+		msg "已设置运营商 VLAN $vid（$D_PONPORT:t + $D_PORT25:u*）"
+	else
+		del_matching_bv "$D_PONPORT:t" ""
+		D_ISPVID=""
+		msg "已移除运营商 tag 配置（回到 untagged 透传）"
+	fi
+}
+
+apply_mgmt() {
+	local scheme="$(d_scheme)"
+	case "$scheme" in
+	none)
+		msg "管理访问：未启用"
+		;;
+	A)
+		msg "管理访问：方案 A（光猫侧无需改动，见 FLASHING.md 6.7.1）"
+		;;
+	B)
+		local vid="$(d_mgmt_vlan)"
+		case "$vid" in ''|*[!0-9]*) die "mgmt_vlan 需要 1..4094 的数字" ;; esac
+		[ "$vid" -ge 1 ] && [ "$vid" -le 4094 ] || die "mgmt_vlan 超出范围"
+		[ -z "$D_ISPVID" ] || [ "$vid" != "$D_ISPVID" ] || die "管理 VLAN 不能与运营商 VLAN 相同（都是 $vid）"
+		uci show network 2>/dev/null | grep -q "\.vlan='$vid'" \
+			&& die "VLAN $vid 已被其它 bridge-vlan 占用，请换 mgmt_vlan"
+		[ -n "$D_PONSEC" ] || die "未桥接且找不到运营商桥：请先在向导里勾选桥接"
+
+		# 千兆口并进运营商桥，管理 VLAN：2.5G 带 tag、千兆口剥 tag
+		local p gbe="$D_GBE"
+		[ -n "$gbe" ] || die "推断不出千兆管理口，无法应用方案 B"
+		uci set "network.$D_PONSEC.vlan_filtering"='1'
+		for p in $gbe; do
+			case " $(sec_ports "$D_PONSEC") " in *" $p "*) ;;
+				*) uci add_list "network.$D_PONSEC.ports=$p" ;;
+			esac
+		done
+		uci add network bridge-vlan >/dev/null
+		uci set "network.@bridge-vlan[-1].device=$D_PONNAME"
+		uci set "network.@bridge-vlan[-1].vlan=$vid"
+		uci add_list "network.@bridge-vlan[-1].ports=$D_PORT25:t"
+		for p in $gbe; do uci add_list "network.@bridge-vlan[-1].ports=$p:u*"; done
+
+		udel network.singlewire
+		uci set network.singlewire=device
+		uci set "network.singlewire.name=$D_PONNAME.$vid"
+		uci set network.singlewire.type='vlan'
+		uci set "network.singlewire.ifname=$D_PONNAME"
+		uci set "network.singlewire.vid=$vid"
+		uci set "network.lan.device=$D_PONNAME.$vid"
+
+		# 原来那个只放千兆口的桥不再需要
+		local lansec="" s
+		for s in $(device_sections); do
+			[ "$(sec_name "$s")" = "br-lan" ] && lansec="$s" && break
+		done
+		[ -z "$lansec" ] || udel "network.$lansec"
+		msg "已应用方案 B（管理 VLAN $vid，管理 IP 移到 $D_PONNAME.$vid）"
+		;;
+	C)
+		local ip="$(d_mgmt_ip)" rtr="$(d_mgmt_rtr)" dev
+		case "$ip" in *.*) ;; *) die "mgmt_ip 需要形如 192.168.9.1 的地址" ;; esac
+		case "$rtr" in *.*) ;; *) die "mgmt_router_ip 需要形如 192.168.9.254 的地址" ;; esac
+		# 情况②：有运营商 tag 时挂 tag VLAN 子接口；情况①：直接挂桥本体
+		if [ -n "$D_ISPVID" ]; then
+			uci set network.mgmtdev=device
+			uci set "network.mgmtdev.name=$D_PONNAME.$D_ISPVID"
+			uci set network.mgmtdev.type='vlan'
+			uci set "network.mgmtdev.ifname=$D_PONNAME"
+			uci set "network.mgmtdev.vid=$D_ISPVID"
+			dev="$D_PONNAME.$D_ISPVID"
+		else
+			udel network.mgmtdev
+			dev="$D_PONNAME"
+		fi
+		uci set network.mgmtwan=interface
+		uci set network.mgmtwan.proto='static'
+		uci set "network.mgmtwan.device=$dev"
+		uci set "network.mgmtwan.ipaddr=$ip"
+		uci set network.mgmtwan.netmask='255.255.255.0'
+		uci set network.mgmtwan.defaultroute='0'
+
+		uci add firewall zone >/dev/null
+		uci set firewall.@zone[-1].name='mgmtwan'
+		uci set firewall.@zone[-1].input='REJECT'
+		uci set firewall.@zone[-1].output='ACCEPT'
+		uci set firewall.@zone[-1].forward='REJECT'
+		uci add_list firewall.@zone[-1].network='mgmtwan'
+		uci add firewall rule >/dev/null
+		uci set firewall.@rule[-1].name='Allow-mgmt-from-router'
+		uci set firewall.@rule[-1].src='mgmtwan'
+		uci set "firewall.@rule[-1].src_ip=$rtr/32"
+		uci set firewall.@rule[-1].proto='tcp'
+		uci set firewall.@rule[-1].dest_port='22 80 443'
+		uci set firewall.@rule[-1].target='ACCEPT'
+		uci add firewall rule >/dev/null
+		uci set firewall.@rule[-1].name='Allow-mgmt-ping'
+		uci set firewall.@rule[-1].src='mgmtwan'
+		uci set "firewall.@rule[-1].src_ip=$rtr/32"
+		uci set firewall.@rule[-1].proto='icmp'
+		uci set firewall.@rule[-1].icmp_type='echo-request'
+		uci set firewall.@rule[-1].target='ACCEPT'
+		msg "已应用方案 C（管理 IP $ip 挂 $dev，仅放行 $rtr）"
+		;;
+	*) die "未知 mgmt_scheme: $scheme" ;;
+	esac
+}
+
+kill_timer() {
+	if [ -f "$TIMER_PID_FILE" ]; then
+		kill "$(cat "$TIMER_PID_FILE" 2>/dev/null)" 2>/dev/null || true
+		rm -f "$TIMER_PID_FILE"
+	fi
+}
+
+cmd_revert() {
+	[ -f "$STATE" ] || die "没有备份记录（$STATE），无法回滚"
+	. "$STATE"
+	[ -f "$NET_BACKUP" ] || die "network 备份不存在: $NET_BACKUP"
+	kill_timer
+	cp "$NET_BACKUP" "$CONFIG_DIR/network"
+	[ -f "$FW_BACKUP" ] && cp "$FW_BACKUP" "$CONFIG_DIR/firewall"
+	rm -f "$KEEP_MARK"
+	"$NETWORK_INIT" reload
+	"$FIREWALL_INIT" reload
+	msg "已回滚到 apply 前的配置并重新加载"
+}
+
+cmd_apply() {
+	local dry=0 yes=0
+	case "$1" in --dry-run) dry=1 ;; --yes|--boot) yes=1 ;; esac
+
+	# 声明合法性预检
+	if [ "$(d_vlan_en)" = "1" ]; then
+		case "$(d_vlan)" in ''|*[!0-9]*) die "wan_vlan 需要 1..4094 的数字" ;; esac
+	fi
+
+	echo "--- 当前状态 ---"
+	echo "桥接           : $([ "$D_BRIDGED" = 1 ] && echo "已桥接（$D_PONNAME = $D_PONPORT + ${D_PORT25:-?}）" || echo 未桥接)"
+	echo "运营商 VLAN    : ${D_ISPVID:-无}"
+	if [ "$D_SCHEME" = "B" ]; then
+		echo "管理访问       : B（管理 VLAN $D_MGMTVID）"
+	elif [ "$D_SCHEME" = "C" ]; then
+		echo "管理访问       : C（管理 IP $D_MGMTIP）"
+	else
+		echo "管理访问       : 无"
+	fi
+	echo "--- 声明目标 ---"
+	echo "桥接           : $([ "$(d_bridged)" = 1 ] && echo 确保 || echo 不变)"
+	echo "运营商 VLAN    : $([ "$(d_vlan_en)" = 1 ] && echo "$(d_vlan)" || echo 无)"
+	echo "管理访问       : $(d_scheme)$([ "$(d_scheme)" = B ] && echo " ($(d_mgmt_vlan))")$([ "$(d_scheme)" = C ] && echo " ($(d_mgmt_ip) / $(d_mgmt_rtr))")"
+
+	if [ "$dry" = "1" ]; then
+		msg "--dry-run：未做任何改动"
+		return 0
+	fi
+
+	local ts="$(date +%Y%m%d-%H%M%S)"
+	mkdir -p "$BACKUP_DIR"
+	NET_BACKUP="$BACKUP_DIR/network.pre-ponwizard.$ts"
+	FW_BACKUP="$BACKUP_DIR/firewall.pre-ponwizard.$ts"
+	cp "$CONFIG_DIR/network" "$NET_BACKUP"
+	cp "$CONFIG_DIR/firewall" "$FW_BACKUP" 2>/dev/null || true
+	printf 'NET_BACKUP=%s\nFW_BACKUP=%s\nAPPLY_TS=%s\nAPPLY_TIMEOUT=%s\n' \
+		"$NET_BACKUP" "$FW_BACKUP" "$(date +%s)" "$TIMEOUT" > "$STATE"
+
+	if [ "$yes" != "1" ]; then
+		rm -f "$KEEP_MARK"
+		kill_timer
+		(
+			sleep "$TIMEOUT"
+			if [ -f "$KEEP_MARK" ]; then
+				rm -f "$TIMER_PID_FILE"
+				exit 0
+			fi
+			cp "$NET_BACKUP" "$CONFIG_DIR/network"
+			[ -f "$FW_BACKUP" ] && cp "$FW_BACKUP" "$CONFIG_DIR/firewall"
+			"$NETWORK_INIT" reload
+			"$FIREWALL_INIT" reload
+			rm -f "$TIMER_PID_FILE" "$KEEP_MARK"
+			logger -t pon-wizard "未在 ${TIMEOUT}s 内确认，已自动回滚" 2>/dev/null
+		) </dev/null >/dev/null 2>&1 &
+		echo $! > "$TIMER_PID_FILE"
+		msg "已武装自动回滚：${TIMEOUT}s 内执行 confirm，否则恢复原配置"
+	fi
+
+	neutralize_mgmt
+	ensure_bridged
+	apply_wan_vlan
+	apply_mgmt
+
+	uci commit network
+	uci commit firewall
+
+	"$NETWORK_INIT" reload
+	sleep 4
+	"$FIREWALL_INIT" reload
+	msg "配置已应用。确认无误后执行：pon-wizard-apply confirm"
+}
+
+cmd_confirm() {
+	touch "$KEEP_MARK"
+	kill_timer
+	msg "已确认保留当前配置"
+}
+
+case "${1:-}" in
+	status)  detect; cmd_status ;;
+	plan)    detect; DRY=1; cmd_apply --dry-run ;;
+	apply)   shift; detect; cmd_apply "$@" ;;
+	confirm) cmd_confirm ;;
+	revert)  cmd_revert ;;
+	*) awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit 1 ;;
+esac

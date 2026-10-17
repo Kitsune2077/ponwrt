@@ -1,0 +1,13 @@
+# PonWrt 接入向导声明式配置（由 LuCI 向导页写入，pon-wizard-apply 读取执行）
+# 注意：实际生效的 network/firewall 配置由 apply 后端生成；本文件只是"期望状态"。
+# 打开向导页时展示的是从实际配置检测出的状态（优先于本声明），避免两者不同步。
+
+config wizard 'config'
+	option bridged '0'
+	option port25 ''
+	option wan_vlan_enabled '0'
+	option wan_vlan ''
+	option mgmt_scheme 'none'
+	option mgmt_vlan '2100'
+	option mgmt_ip '192.168.9.1'
+	option mgmt_router_ip '192.168.9.254'
