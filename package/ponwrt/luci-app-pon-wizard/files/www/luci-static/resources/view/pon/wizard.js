@@ -327,10 +327,48 @@ return view.extend({
 				uci.set('ponwizard', 'config', 'wan_pbit', elPbit.value);
 
 				return uci.save()
-					.then(function() { return L.resolveDefault(fs.exec_direct(APPLY, [ 'apply' ]), null); })
+					.then(function() {
+						applyBtn.disabled = true;
+						ui.showModal(_('正在应用配置'), [
+							E('p', {}, E('em', { 'class': 'spinning' },
+								_('正在执行应用脚本（含网络重载，约需十秒），请勿关闭页面……')))
+						]);
+						return L.resolveDefault(fs.exec_direct(APPLY, [ 'apply' ]), null);
+					})
 					.then(function(output) {
+						applyBtn.disabled = false;
+						var okc = !!(output && output.indexOf('配置已应用') >= 0);
+						var keepBtn = E('button', {
+							'class': 'btn cbi-button cbi-button-apply important',
+							'click': ui.createHandlerFn(self, function() {
+								return fs.exec_direct(APPLY, [ 'confirm' ])
+									.then(function() { ui.hideModal(); return self.refresh(); });
+							})
+						}, _('确认保留'));
+						var revBtn = E('button', {
+							'class': 'btn cbi-button cbi-button-reset',
+							'click': ui.createHandlerFn(self, function() {
+								return fs.exec_direct(APPLY, [ 'revert' ])
+									.then(function() { ui.hideModal(); return self.refresh(); });
+							})
+						}, _('立即回滚'));
+						var closeBtn = E('button', {
+							'class': 'btn cbi-button',
+							'click': ui.hideModal
+						}, _('关闭'));
+
 						out.style.display = '';
 						dom.content(out, output || _('应用失败 —— 刷新页面重新读取状态。'));
+
+						ui.showModal(okc ? _('已应用，等待确认') : _('应用失败'), [
+							E('pre', { 'style': 'max-height: 260px; overflow: auto; white-space: pre-wrap; font-size: smaller' },
+								(output || _('没有输出'))),
+							E('p', {}, okc
+								? _('配置已生效，但 10 分钟内未确认会自动恢复原状。请验证后点击「确认保留」。')
+								: _('请检查上方输出；可点「立即回滚」恢复应用前状态。')),
+							E('div', { 'class': 'right' },
+								okc ? [ revBtn, ' ', keepBtn ] : [ revBtn, ' ', closeBtn ])
+						]);
 						return self.refresh();
 					});
 			})
