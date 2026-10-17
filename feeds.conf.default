@@ -1,4 +1,7 @@
-src-git packages https://github.com/immortalwrt/packages.git
+# 2026-10-17 钉住：上游 983e2638683b 把 miniupnpd 升到 2.3.11，但 020/030/040
+# 三个本地补丁未跟进（030 已被上游吸收、020/040 直接打不上），feed HEAD 处于
+# 不可构建状态。钉在其父提交（miniupnpd 2.3.9-r3）；上游修复后放开即可。
+src-git packages https://github.com/immortalwrt/packages.git^1340fb4ca16cc34aa3c9a8fcab7c79cb75ad849a
 src-git luci https://github.com/immortalwrt/luci.git
 src-git routing https://github.com/openwrt/routing.git
 src-git telephony https://github.com/openwrt/telephony.git
