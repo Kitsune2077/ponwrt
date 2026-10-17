@@ -143,6 +143,8 @@ return view.extend({
 			modeDesc = _('路由（光猫拨号');
 			if (status.router_vid)
 				modeDesc += _('，VLAN %s').format(status.router_vid);
+			if (status.router_pbit)
+				modeDesc += _('，P-bit %s').format(status.router_pbit);
 			if (status.pppoe_user)
 				modeDesc += _('，账号 %s').format(status.pppoe_user);
 			modeDesc += '）';
@@ -203,6 +205,7 @@ return view.extend({
 		var vVlan = det.isp_vid || det.router_vid || declared.wan_vlan || '';
 		var vUser = det.pppoe_user || declared.pppoe_user || '';
 		var vIpv6 = (declared.wan_ipv6 == null) ? true : (declared.wan_ipv6 == '1');
+		var vPbit = det.router_pbit || declared.wan_pbit || '';
 		var vScheme = (detMgmt.scheme != 'none') ? detMgmt.scheme
 			: (declared.mgmt_scheme != null ? declared.mgmt_scheme : 'none');
 		var vMgmtVlan = detMgmt.vid || declared.mgmt_vlan || '2100';
@@ -230,7 +233,7 @@ return view.extend({
 			}));
 		var elVlanEn = E('input', { 'type': 'checkbox', 'checked': vVlanEn ? 'checked' : null });
 		var elVlan = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'value': vVlan,
-			'placeholder': '3114', 'style': 'width: 8em' });
+			'placeholder': '1-4094', 'style': 'width: 8em' });
 		var elScheme = E('select', { 'class': 'cbi-input-select' },
 			Object.keys(schemeLabels).map(function(k) {
 				return E('option', { 'value': k, 'selected': (k == vScheme) ? 'selected' : null },
@@ -246,6 +249,11 @@ return view.extend({
 			'placeholder': 'user@broadband' });
 		var elPppPass = E('input', { 'type': 'password', 'class': 'cbi-input-text', 'value': declared.pppoe_pass || '' });
 		var elIpv6 = E('input', { 'type': 'checkbox', 'checked': vIpv6 ? 'checked' : null });
+		var elPbit = E('select', { 'class': 'cbi-input-select' },
+			[ [ '', _('默认（PCP 0）') ], [ '0', '0' ], [ '1', '1' ], [ '2', '2' ], [ '3', '3' ],
+			  [ '4', '4' ], [ '5', '5' ], [ '6', '6' ], [ '7', '7' ] ].map(function(o) {
+				return E('option', { 'value': o[0], 'selected': (o[0] == vPbit) ? 'selected' : null }, o[1]);
+			}));
 
 		var blockB = E('div', { 'style': (vScheme == 'B') ? '' : 'display: none' });
 		var blockC = E('div', { 'style': (vScheme == 'C') ? '' : 'display: none' });
@@ -316,6 +324,7 @@ return view.extend({
 				uci.set('ponwizard', 'config', 'pppoe_user', puser);
 				uci.set('ponwizard', 'config', 'pppoe_pass', ppass);
 				uci.set('ponwizard', 'config', 'wan_ipv6', elIpv6.checked ? '1' : '0');
+				uci.set('ponwizard', 'config', 'wan_pbit', elPbit.value);
 
 				return uci.save()
 					.then(function() { return L.resolveDefault(fs.exec_direct(APPLY, [ 'apply' ]), null); })
@@ -350,7 +359,9 @@ return view.extend({
 			fieldRow(_('PPPoE 密码'), elPppPass,
 				_('留空则沿用已保存的密码（检测到已配置账号时可不重填）。')),
 			fieldRow(_('IPv6（DHCPv6）'), elIpv6,
-				_('勾选后在 PPPoE 之上建立 wan6（dhcpv6，缺省开启）。')));
+				_('勾选后在 PPPoE 之上建立 wan6（dhcpv6，缺省开启）。')),
+			fieldRow(_('802.1p 优先级（P-bit）'), elPbit,
+				_('局点要求非 0 P-bit 时选择（OLT 按 VLAN+优先级区分业务）；默认不设置即 PCP 0。仅路由模式带 tag 时生效。')));
 
 		return E('div', { 'class': 'cbi-section' }, [
 			E('h3', {}, _('期望配置')),
@@ -360,8 +371,8 @@ return view.extend({
 
 			fieldRow(_('运营商 VLAN tag'), [ elVlanEn, ' ', elVlan ],
 				vOpMode == 'router'
-					? _('OLT 下发的上网业务带 tag 时勾选（如 3114），拨号走 pon0.<VLAN> 子接口。')
-					: _('OLT 下发的上网业务带 tag 时勾选（如 3114）；2.5G 侧保持 untagged 给路由器 PPPoE。')),
+					? _('OLT 下发的上网业务带 tag 时勾选，拨号走 pon0.<VLAN> 子接口。')
+					: _('OLT 下发的上网业务带 tag 时勾选；2.5G 侧保持 untagged 给路由器 PPPoE。')),
 
 			bridgeBlock,
 			routerBlock,

@@ -62,6 +62,7 @@ d_mgmt_rtr()  { uget "$WIZCFG.config.mgmt_router_ip" || echo 192.168.9.254; }
 d_pppoe_user(){ uget "$WIZCFG.config.pppoe_user"; }
 d_pppoe_pass(){ uget "$WIZCFG.config.pppoe_pass"; }
 d_wan_ipv6()  { uget "$WIZCFG.config.wan_ipv6" || echo 1; }
+d_wan_pbit()  { uget "$WIZCFG.config.wan_pbit"; }
 
 # ---------- 实际状态检测 ----------
 # 检测结果放在这些全局变量里：
@@ -109,7 +110,7 @@ detect() {
 	D_BRIDGED=0; D_PONSEC=""; D_PONNAME=""; D_PONPORT=""; D_PORT25=""
 	D_GBE=""; D_ISPVID=""; D_SCHEME="none"; D_MGMTVID=""
 	D_MGMTIP=""; D_MGMTMASK=""; D_MGMTDEV=""; D_MGMTRTR=""
-	D_OPMODE="router"; D_RVID=""; D_USER=""
+	D_OPMODE="router"; D_RVID=""; D_USER=""; D_RPBIT=""
 
 	# 找端口里含 pon* 的桥（运营商桥）
 	local s p ports
@@ -133,7 +134,19 @@ detect() {
 			pon*) D_PONPORT="${_wdev%%.*}" ;;
 		esac
 		case "$_wdev" in
-			"$D_PONPORT".*) D_RVID="${_wdev##*.}" ;;
+			"$D_PONPORT".*)
+			D_RVID="${_wdev##*.}"
+			# 802.1p：从 8021q 段的 egress-qos-map 解析出统一的 P-bit
+			local qsec qt
+			for qsec in $(device_sections); do
+				[ "$(uget network.$qsec.name)" = "$_wdev" ] || continue
+				for qt in $(uget network.$qsec.egress-qos-map); do
+					case "$qt" in *:*) D_RPBIT="${qt##*:}" ;; esac
+					break
+				done
+				break
+			done
+			;;
 		esac
 		D_USER="$(uget network.wan.username)"
 		return 0
@@ -248,9 +261,10 @@ sync_state() {
 		echo 0; return
 	fi
 	if [ "$(d_opmode)" = "router" ]; then
-		# 路由模式：比对 VLAN 子接口与 PPPoE 用户名（密码不比对）
+		# 路由模式：比对 VLAN 子接口、P-bit 与 PPPoE 用户名（密码不比对）
 		if [ "$(d_vlan_en)" = "1" ]; then
 			[ -n "$D_RVID" ] && [ "$(d_vlan)" = "$D_RVID" ] || ok=0
+			[ "$(d_wan_pbit)" = "$D_RPBIT" ] || ok=0
 		else
 			[ -z "$D_RVID" ] || ok=0
 		fi
@@ -303,6 +317,7 @@ cmd_status() {
 	 "gbe_ports": $(json_arr "${D_GBE:-}"),
 	 "isp_vid": $(json_str "$D_ISPVID"),
 	 "router_vid": $(json_str "$D_RVID"),
+	 "router_pbit": $(json_str "$D_RPBIT"),
 	 "pppoe_user": $(json_str "$D_USER"),
 	 "mgmt": $mgmt,
 	 "declared": {
@@ -316,7 +331,8 @@ cmd_status() {
 	  "mgmt_ip": $(json_str "$(d_mgmt_ip)"),
 	  "mgmt_router_ip": $(json_str "$(d_mgmt_rtr)"),
 	  "pppoe_user": $(json_str "$(d_pppoe_user)"),
-	  "wan_ipv6": $(json_bool "$(d_wan_ipv6)")
+	  "wan_ipv6": $(json_bool "$(d_wan_ipv6)"),
+	  "wan_pbit": $(json_str "$(d_wan_pbit)")
 	 },
 	 "in_sync": $(json_bool "$(sync_state)"),
 	 "timer": {"armed": $armed, "remaining": $remaining}
@@ -600,9 +616,22 @@ apply_router() {
 		uci set "network.ponwan.ifname=$D_PONPORT"
 		uci set "network.ponwan.vid=$vid"
 		uci set "network.wan.device=$D_PONPORT.$vid"
+		# 802.1p：非 0 时把全部 skb 优先级统一映射到指定 P-bit
+		# （不设置时内核默认 PCP 0，等价于常见的 egress-qos-map 0:0）
+		local pbit="$(d_wan_pbit)" p map=""
+		case "$pbit" in ''|*[!0-9]*) pbit="" ;; esac
+		if [ -n "$pbit" ]; then
+			[ "$pbit" -ge 0 ] && [ "$pbit" -le 7 ] || die "wan_pbit 超出范围（0..7）"
+			for p in 0 1 2 3 4 5 6 7; do map="$map $p:$pbit"; done
+			uci set "network.ponwan.egress-qos-map=$(echo $map)"
+			D_RPBIT="$pbit"
+		else
+			D_RPBIT=""
+		fi
 	else
 		udel network.ponwan
 		uci set "network.wan.device=${D_PONPORT:-pon0}"
+		D_RPBIT=""
 	fi
 
 	uci set network.wan.proto='pppoe'
