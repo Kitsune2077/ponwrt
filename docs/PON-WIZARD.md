@@ -1,7 +1,13 @@
 # LuCI 接入向导（luci-app-pon-wizard）
 
 把开通一只 PonWrt 光猫所需的**光猫侧**配置收敛到 LuCI 的一个页面里：
-**网络 → PON → Wizard**。覆盖 [FLASHING.md](FLASHING.md) 的三块手工流程：
+**网络 → PON → 接入向导**。先选**工作模式**，再按模式收尾：
+
+- **路由模式**（光猫自己 PPPoE 拨号，不桥接）：填 PPPoE 用户名/密码即可，
+  可选运营商 VLAN（拨号走 `pon0.<vid>` 8021q 子接口）与 IPv6（wan6，
+  dhcpv6@wan，缺省开启）——出厂态只需这一步就是一台完整路由器；
+- **桥接模式**（2.5G 口透传给下游拨号）：覆盖 [FLASHING.md](FLASHING.md)
+  的三块手工流程：
 
 | 向导选项 | 对应文档 | 生成内容 |
 | --- | --- | --- |
@@ -9,14 +15,19 @@
 | 「运营商 VLAN tag」 | 6.4 | `bridge-vlan <vid>`：pon0 带 tag、2.5G 口剥 tag（下游 PPPoE 拿 untagged） |
 | 「管理访问方案」B/C | 6.7.2 / 6.7.4 | 一键生成单线复用（B：管理 VLAN；C：WAN 桥上挂新网段管理 IP + 收紧的防火墙区） |
 
-配合 luci-app-pon 自带的 LOID/序列号配置页，「LOID + VLAN + 桥接 + 管理访问」
-在同一处闭环。方案 C 搭配路由器侧 `luci-app-ap-modem` 插件时，两端各点一次即完成。
+两种模式可随时互转：桥接 → 路由会自动拆桥（全部端口收回 br-lan、清除
+bridge-vlan，再建 pppoe）；路由 → 桥接会删除 8021q/PPPoE 残留并重建桥。
+配合 luci-app-pon 自带的 LOID/序列号配置页，「LOID + VLAN + 拨号/桥接 +
+管理访问」在同一处闭环。方案 C 搭配路由器侧 `luci-app-ap-modem` 插件时，
+两端各点一次即完成。
 
 ## 状态回读（关键设计）
 
 页面打开时展示的是**从实际配置反推的当前状态**（`pon-wizard-apply status`），
 不是仅读声明文件：
 
+- 工作模式自动识别：wan 挂 pon 桥且 proto=none → 桥接；wan 是
+  pppoe/dhcp 且挂在 pon0（或 `pon0.<vid>`，出厂态也算）→ 路由；
 - 已按文档手工配过方案 B（或跑过 `ponwrt-single-wire.sh`）/方案 C 的光猫，
   会自动识别并**预勾选对应选项**（声明文件为空也照样识别）；
 - 检测到的状态与保存的声明不一致时，页面顶部显示提示横幅；
@@ -44,12 +55,12 @@
 
 ## 测试
 
-离线测试装置（uci 模拟器 + 四种初始状态 fixture + 六组迁移断言）在构建服务器
-`~/ponwiz-test/` 上运行，**56/56 通过**，覆盖：出厂/6.2 桥接/手工 B/手工 C 的
-状态识别、出厂→桥接+VLAN+C 一键开通、C→B 切换（含中性化）、B→清除（还原
-br-lan）、自动回滚定时器、confirm 解除、br-lan 摘空拒绝。真机安装验证待光猫
-恢复可达后进行（apk 已在 10.0.0.108 编出：
-`bin/packages/aarch64_cortex-a53/base/luci-app-pon-wizard-1.0.0-r1.apk`）。
+离线测试装置（uci 模拟器 + fixture + 迁移断言）在构建服务器 `~/ponwiz-test/`
+上运行，**83/83 通过**，覆盖：出厂/6.2 桥接/手工 B/手工 C/HG5382A 混合态/
+路由模式（pppoe@pon0.3114 + wan6）的状态识别、出厂→桥接+VLAN+C 一键开通、
+C→B 切换（含中性化）、B→清除（还原 br-lan）、**桥接→路由**（拆桥合并端口 +
+8021q + PPPoE + wan6）、**路由→桥接**（清理残留重建桥）、自动回滚定时器、
+confirm 解除、br-lan 摘空拒绝。
 
 ## 构建
 

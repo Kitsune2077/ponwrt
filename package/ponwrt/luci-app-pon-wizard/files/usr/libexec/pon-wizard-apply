@@ -50,6 +50,7 @@ json_arr() {
 }
 
 # ---------- 声明（/etc/config/ponwizard） ----------
+d_opmode()    { uget "$WIZCFG.config.op_mode" || echo bridge; }
 d_bridged()   { uget "$WIZCFG.config.bridged" || echo 0; }
 d_port25()    { uget "$WIZCFG.config.port25"; }
 d_vlan_en()   { uget "$WIZCFG.config.wan_vlan_enabled" || echo 0; }
@@ -58,11 +59,15 @@ d_scheme()    { uget "$WIZCFG.config.mgmt_scheme" || echo none; }
 d_mgmt_vlan() { uget "$WIZCFG.config.mgmt_vlan" || echo 2100; }
 d_mgmt_ip()   { uget "$WIZCFG.config.mgmt_ip" || echo 192.168.9.1; }
 d_mgmt_rtr()  { uget "$WIZCFG.config.mgmt_router_ip" || echo 192.168.9.254; }
+d_pppoe_user(){ uget "$WIZCFG.config.pppoe_user"; }
+d_pppoe_pass(){ uget "$WIZCFG.config.pppoe_pass"; }
+d_wan_ipv6()  { uget "$WIZCFG.config.wan_ipv6" || echo 1; }
 
 # ---------- 实际状态检测 ----------
 # 检测结果放在这些全局变量里：
-#   D_BRIDGED D_PONSEC D_PONNAME D_PONPORT D_PORT25 D_GBE
+#   D_OPMODE(bridge/router) D_BRIDGED D_PONSEC D_PONNAME D_PONPORT D_PORT25 D_GBE
 #   D_ISPVID  D_SCHEME(B/C/none) D_MGMTVID D_MGMTIP D_MGMTMASK D_MGMDDEV D_MGMTRTR
+#   D_RVID（路由模式 wan 挂的 pon0.<vid>） D_USER（pppoe 用户名）
 device_sections() { uci show network 2>/dev/null | sed -n "s/^network\.\([^.]*\)=device$/\1/p"; }
 bridgevlan_sections() { uci show network 2>/dev/null | sed -n "s/^network\.\([^.]*\)=bridge-vlan$/\1/p"; }
 
@@ -104,6 +109,7 @@ detect() {
 	D_BRIDGED=0; D_PONSEC=""; D_PONNAME=""; D_PONPORT=""; D_PORT25=""
 	D_GBE=""; D_ISPVID=""; D_SCHEME="none"; D_MGMTVID=""
 	D_MGMTIP=""; D_MGMTMASK=""; D_MGMTDEV=""; D_MGMTRTR=""
+	D_OPMODE="router"; D_RVID=""; D_USER=""
 
 	# 找端口里含 pon* 的桥（运营商桥）
 	local s p ports
@@ -117,7 +123,21 @@ detect() {
 			esac
 		done
 	done
-	[ -n "$D_PONNAME" ] || return 0
+	_wdev="$(uget network.wan.device)"
+	_wproto="$(uget network.wan.proto)"
+
+	[ -n "$D_PONNAME" ] || {
+		# 无 pon 桥（路由模式/出厂态）：从 wan 设备兜底解析 pon 口与
+		# 路由模式参数，然后结束——后面的检测都以桥存在为前提
+		case "$_wdev" in
+			pon*) D_PONPORT="${_wdev%%.*}" ;;
+		esac
+		case "$_wdev" in
+			"$D_PONPORT".*) D_RVID="${_wdev##*.}" ;;
+		esac
+		D_USER="$(uget network.wan.username)"
+		return 0
+	}
 
 	# 2.5G 口 = 运营商桥里除 pon 外的第一个口（声明值兜底）
 	for p in $(sec_ports "$D_PONSEC"); do
@@ -128,12 +148,22 @@ detect() {
 	# 桥接判定：wan 接口挂在该桥上且 proto=none（FLASHING 6.2 ③）。
 	# 放宽：wan 是空段（无 device/proto，等价 proto=none）也算已桥接——
 	# 只要 pon 桥本身带非 pon 成员口，透传拓扑已经成立。
-	_wdev="$(uget network.wan.device)"
-	_wproto="$(uget network.wan.proto)"
 	if { [ "$_wdev" = "$D_PONNAME" ] || [ -z "$_wdev" ]; } \
 	   && { [ -z "$_wproto" ] || [ "$_wproto" = "none" ]; } \
 	   && [ -n "$D_PORT25" ]; then
 		D_BRIDGED=1
+	fi
+
+	# 工作模式：满足桥接判定为 bridge；wan 挂在 pon0（或其 VLAN 子接口）
+	# 上拨号/DHCP 则是 router（出厂状态 dhcp@pon0 也归入 router 形态）。
+	if [ "$D_BRIDGED" = "1" ]; then
+		D_OPMODE="bridge"
+	else
+		D_OPMODE="router"
+		case "$_wdev" in
+			"$D_PONPORT".*) D_RVID="${_wdev##*.}" ;;
+		esac
+		D_USER="$(uget network.wan.username)"
 	fi
 
 	# 运营商 tag：该桥上带 pon:t 的 bridge-vlan（6.4 签名）
@@ -212,8 +242,21 @@ detect() {
 }
 
 sync_state() {
-	# 声明与实际是否一致（桥接是单向语义，不参与比对）
+	# 声明与实际是否一致（桥接 checkbox 是单向语义，不参与比对）
 	local ok=1
+	if [ "$(d_opmode)" != "$D_OPMODE" ]; then
+		echo 0; return
+	fi
+	if [ "$(d_opmode)" = "router" ]; then
+		# 路由模式：比对 VLAN 子接口与 PPPoE 用户名（密码不比对）
+		if [ "$(d_vlan_en)" = "1" ]; then
+			[ -n "$D_RVID" ] && [ "$(d_vlan)" = "$D_RVID" ] || ok=0
+		else
+			[ -z "$D_RVID" ] || ok=0
+		fi
+		[ "$(d_pppoe_user)" = "$D_USER" ] || [ -z "$D_USER" ] || ok=0
+		echo "$ok"; return
+	fi
 	if [ "$(d_vlan_en)" = "1" ]; then
 		[ -n "$D_ISPVID" ] && [ "$(d_vlan)" = "$D_ISPVID" ] || ok=0
 	else
@@ -252,14 +295,18 @@ cmd_status() {
 	cat <<-EOF
 	{
 	 "script_version": 1,
+	 "op_mode": $(json_str "${D_OPMODE:-bridge}"),
 	 "bridged": $(json_bool "$D_BRIDGED"),
 	 "pon_bridge": $(json_str "$D_PONNAME"),
 	 "pon_port": $(json_str "$D_PONPORT"),
 	 "port25": $(json_str "$D_PORT25"),
 	 "gbe_ports": $(json_arr "${D_GBE:-}"),
 	 "isp_vid": $(json_str "$D_ISPVID"),
+	 "router_vid": $(json_str "$D_RVID"),
+	 "pppoe_user": $(json_str "$D_USER"),
 	 "mgmt": $mgmt,
 	 "declared": {
+	  "op_mode": $(json_str "$(d_opmode)"),
 	  "bridged": $(json_bool "$(d_bridged)"),
 	  "port25": $(json_str "$(d_port25)"),
 	  "wan_vlan_enabled": $(json_bool "$(d_vlan_en)"),
@@ -267,7 +314,9 @@ cmd_status() {
 	  "mgmt_scheme": $(json_str "$(d_scheme)"),
 	  "mgmt_vlan": $(json_str "$(d_mgmt_vlan)"),
 	  "mgmt_ip": $(json_str "$(d_mgmt_ip)"),
-	  "mgmt_router_ip": $(json_str "$(d_mgmt_rtr)")
+	  "mgmt_router_ip": $(json_str "$(d_mgmt_rtr)"),
+	  "pppoe_user": $(json_str "$(d_pppoe_user)"),
+	  "wan_ipv6": $(json_bool "$(d_wan_ipv6)")
 	 },
 	 "in_sync": $(json_bool "$(sync_state)"),
 	 "timer": {"armed": $armed, "remaining": $remaining}
@@ -354,6 +403,7 @@ ensure_bridged() {
 	uci set "network.wan.device=${D_PONNAME:-br-wan}"
 	uci set network.wan.proto='none'
 	udel network.wan6
+	udel network.ponwan   # 路由模式残留的 8021q 子接口
 	D_BRIDGED=1; D_PORT25="$p25"
 	[ -n "$D_PONNAME" ] || { D_PONSEC=brwan; D_PONNAME=br-wan; D_PONPORT=pon0; }
 	msg "已确保 2.5G 桥接（$D_PONNAME = $D_PONPORT + $p25，wan proto=none）"
@@ -487,6 +537,87 @@ kill_timer() {
 	fi
 }
 
+# 删除运营商桥上的全部 bridge-vlan（切路由模式拆桥用）
+del_all_bv() {
+	local s found
+	while :; do
+		found=""
+		for s in $(bridgevlan_sections); do
+			[ "$(uget network.$s.device)" = "$D_PONNAME" ] && { found="$s"; break; }
+		done
+		[ -n "$found" ] || break
+		udel "network.$found"
+	done
+}
+
+# 拆掉 pon 桥：全部端口收回 br-lan，删除桥与 VLAN 段（管理入口回到千兆口）
+teardown_bridge() {
+	[ -n "$D_PONSEC" ] || return 0
+	del_all_bv
+	udel network.singlewire
+
+	local p s lansec=""
+	for s in $(device_sections); do
+		[ "$(sec_name "$s")" = "br-lan" ] && lansec="$s" && break
+	done
+	if [ -z "$lansec" ]; then
+		uci set network.lanbr=device
+		uci set network.lanbr.name='br-lan'
+		uci set network.lanbr.type='bridge'
+		lansec=lanbr
+	fi
+	# br-lan = 现有端口 ∪ pon 桥收回的端口（去重，去掉 pon 口本身）
+	local merged=""
+	for p in $(sec_ports "$lansec") $(sec_ports "$D_PONSEC"); do
+		case "$p" in "$D_PONPORT") continue ;; esac
+		case " $merged " in *" $p "*) ;; *) merged="$merged $p" ;; esac
+	done
+	udel "network.$lansec.ports"
+	for p in $merged; do uci add_list "network.$lansec.ports=$p"; done
+	udel "network.$D_PONSEC"
+	uci set network.lan.device='br-lan'
+	D_BRIDGED=0; D_PONSEC=""; D_PONNAME=""; D_PORT25=""; D_ISPVID=""; D_GBE=""
+	msg "已拆除 2.5G 桥接（全部端口收回 br-lan）"
+}
+
+# 路由模式：光猫自己拨号（wan=pppoe，可选运营商 VLAN 子接口 + wan6）
+apply_router() {
+	local user="$(d_pppoe_user)" pass="$(d_pppoe_pass)" vid=""
+
+	[ -n "$user" ] || die "路由模式需要 PPPoE 用户名（pppoe_user）"
+
+	[ "$D_BRIDGED" = "1" ] && teardown_bridge
+
+	# 运营商带 tag：8021q 子接口 pon0.<vid>；untagged 直接 pon0
+	if [ "$(d_vlan_en)" = "1" ]; then
+		vid="$(d_vlan)"
+		case "$vid" in ''|*[!0-9]*) die "wan_vlan 需要 1..4094 的数字" ;; esac
+		[ "$vid" -ge 1 ] && [ "$vid" -le 4094 ] || die "wan_vlan 超出范围"
+		udel network.ponwan
+		uci set network.ponwan=device
+		uci set "network.ponwan.name=$D_PONPORT.$vid"
+		uci set network.ponwan.type='8021q'
+		uci set "network.ponwan.ifname=$D_PONPORT"
+		uci set "network.ponwan.vid=$vid"
+		uci set "network.wan.device=$D_PONPORT.$vid"
+	else
+		udel network.ponwan
+		uci set "network.wan.device=${D_PONPORT:-pon0}"
+	fi
+
+	uci set network.wan.proto='pppoe'
+	uci set "network.wan.username=$user"
+	[ -n "$pass" ] && uci set "network.wan.password=$pass"
+	udel network.wan6
+	if [ "$(d_wan_ipv6)" = "1" ]; then
+		uci set network.wan6=interface
+		uci set network.wan6.device='@wan'
+		uci set network.wan6.proto='dhcpv6'
+	fi
+	D_OPMODE="router"; D_RVID="$vid"; D_USER="$user"
+	msg "已应用路由模式（pppoe@$D_PONPORT${vid:+.$vid}${user:+，账号 $user}）"
+}
+
 cmd_revert() {
 	[ -f "$STATE" ] || die "没有备份记录（$STATE），无法回滚"
 	. "$STATE"
@@ -510,7 +641,11 @@ cmd_apply() {
 	fi
 
 	echo "--- 当前状态 ---"
-	echo "桥接           : $([ "$D_BRIDGED" = 1 ] && echo "已桥接（$D_PONNAME = $D_PONPORT + ${D_PORT25:-?}）" || echo 未桥接)"
+	if [ "$D_OPMODE" = "router" ]; then
+		echo "工作模式       : 路由（wan=$(uget network.wan.proto)@$(uget network.wan.device)）"
+	else
+		echo "工作模式       : 桥接（$D_PONNAME = $D_PONPORT + ${D_PORT25:-?}）"
+	fi
 	echo "运营商 VLAN    : ${D_ISPVID:-无}"
 	if [ "$D_SCHEME" = "B" ]; then
 		echo "管理访问       : B（管理 VLAN $D_MGMTVID）"
@@ -559,9 +694,13 @@ cmd_apply() {
 	fi
 
 	neutralize_mgmt
-	ensure_bridged
-	apply_wan_vlan
-	apply_mgmt
+	if [ "$(d_opmode)" = "router" ]; then
+		apply_router
+	else
+		ensure_bridged
+		apply_wan_vlan
+		apply_mgmt
+	fi
 
 	uci commit network
 	uci commit firewall

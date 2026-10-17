@@ -93,10 +93,14 @@ function execJSON(command, args) {
 		});
 }
 
+/* 行结构对齐 luci-base 自带的 status include（tr/td class + width 属性）：
+ * 主题的小屏响应式规则作用在 .td 类上，裸 td 会漏掉这些规则，小屏下表格
+ * 内容收缩、右侧留白；width 属性只在没有 CSS 覆盖时生效，正好作为桌面端
+ * 的列宽提示。 */
 function row(label, value) {
-	return E('tr', {}, [
-		E('td', { 'style': 'width: 42%' }, label),
-		E('td', {}, (value == null || value === '') ? _('未知') : String(value))
+	return E('tr', { 'class': 'tr' }, [
+		E('td', { 'class': 'td left pon-label', 'width': '42%' }, label),
+		E('td', { 'class': 'td left' }, (value == null || value === '') ? _('未知') : String(value))
 	]);
 }
 

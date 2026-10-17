@@ -127,12 +127,28 @@ return view.extend({
 				mgmt = _('无');
 		}
 
+		/* 行结构对齐 luci-base 的 status include（同概览页 PON 卡片的处理）：
+		 * .tr/.td class 让主题的小屏响应式规则生效，width 属性作为桌面端列宽 */
 		var row = function(l, v) {
-			return E('tr', {}, [
-				E('td', { 'style': 'width: 42%' }, l),
-				E('td', {}, (v == null || v === '') ? _('未知') : String(v))
+			return E('tr', { 'class': 'tr' }, [
+				E('td', { 'class': 'td left pw-label', 'width': '42%' }, l),
+				E('td', { 'class': 'td left' }, (v == null || v === '') ? _('未知') : String(v))
 			]);
 		};
+
+		var modeDesc;
+		if (status == null)
+			modeDesc = _('未知');
+		else if (status.op_mode == 'router') {
+			modeDesc = _('路由（光猫拨号');
+			if (status.router_vid)
+				modeDesc += _('，VLAN %s').format(status.router_vid);
+			if (status.pppoe_user)
+				modeDesc += _('，账号 %s').format(status.pppoe_user);
+			modeDesc += '）';
+		}
+		else
+			modeDesc = _('桥接（%s = %s + %s）').format(status.pon_bridge, status.pon_port, status.port25);
 
 		return E('div', { 'class': 'cbi-section' }, [
 			E('h3', {}, _('检测到的状态')),
@@ -141,9 +157,8 @@ return view.extend({
 					_('检测到的实际配置与保存的声明不一致：保存后系统将按下方表单收敛。'))
 				: E([])),
 			E('table', { 'class': 'table' }, [
-				row(_('已桥接给下游 PPPoE'),
-					status.bridged ? _('是（%s = %s + %s）').format(status.pon_bridge, status.pon_port, status.port25) : _('否')),
-				row(_('运营商 VLAN'), status.isp_vid || _('无（untagged）')),
+				row(_('工作模式'), modeDesc),
+				row(_('运营商 VLAN'), status.isp_vid || status.router_vid || _('无（untagged）')),
 				row(_('管理访问'), mgmt)
 			]),
 			E('div', { 'id': 'pw-timer-slot' }, this.renderTimer(status))
@@ -180,10 +195,14 @@ return view.extend({
 		var det = status || {};
 		var detMgmt = det.mgmt || { scheme: 'none' };
 
+		var vOpMode = (det.op_mode != null && det.op_mode !== '') ? det.op_mode
+			: (declared.op_mode != null ? declared.op_mode : 'bridge');
 		var vBridged = !!(det.bridged || effective(null, declared, 'bridged'));
 		var vPort25 = det.port25 || (declared.port25 != null && declared.port25 !== '' ? declared.port25 : 'lan1');
-		var vVlanEn = !!(det.isp_vid || effective(null, declared, 'wan_vlan_enabled'));
-		var vVlan = det.isp_vid || declared.wan_vlan || '';
+		var vVlanEn = !!(det.isp_vid || det.router_vid || effective(null, declared, 'wan_vlan_enabled'));
+		var vVlan = det.isp_vid || det.router_vid || declared.wan_vlan || '';
+		var vUser = det.pppoe_user || declared.pppoe_user || '';
+		var vIpv6 = (declared.wan_ipv6 == null) ? true : (declared.wan_ipv6 == '1');
 		var vScheme = (detMgmt.scheme != 'none') ? detMgmt.scheme
 			: (declared.mgmt_scheme != null ? declared.mgmt_scheme : 'none');
 		var vMgmtVlan = detMgmt.vid || declared.mgmt_vlan || '2100';
@@ -198,6 +217,12 @@ return view.extend({
 		});
 		portCand.sort();
 
+		var elMode = E('select', { 'class': 'cbi-input-select' }, [
+			E('option', { 'value': 'bridge', 'selected': (vOpMode == 'bridge') ? 'selected' : null },
+				_('桥接模式 —— 下游路由器 PPPoE 拨号')),
+			E('option', { 'value': 'router', 'selected': (vOpMode == 'router') ? 'selected' : null },
+				_('路由模式 —— 光猫内部 PPPoE 拨号'))
+		]);
 		var elBridged = E('input', { 'type': 'checkbox', 'checked': vBridged ? 'checked' : null });
 		var elPort25 = E('select', { 'class': 'cbi-input-select' },
 			portCand.map(function(p) {
@@ -217,13 +242,23 @@ return view.extend({
 			'placeholder': '192.168.9.1' });
 		var elMgmtRtr = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'value': vMgmtRtr,
 			'placeholder': '192.168.9.254' });
+		var elPppUser = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'value': vUser,
+			'placeholder': 'user@broadband' });
+		var elPppPass = E('input', { 'type': 'password', 'class': 'cbi-input-text', 'value': declared.pppoe_pass || '' });
+		var elIpv6 = E('input', { 'type': 'checkbox', 'checked': vIpv6 ? 'checked' : null });
 
 		var blockB = E('div', { 'style': (vScheme == 'B') ? '' : 'display: none' });
 		var blockC = E('div', { 'style': (vScheme == 'C') ? '' : 'display: none' });
+		var bridgeBlock = E('div', { 'style': (vOpMode == 'bridge') ? '' : 'display: none' });
+		var routerBlock = E('div', { 'style': (vOpMode == 'router') ? '' : 'display: none' });
 
 		elScheme.addEventListener('change', function() {
 			blockB.style.display = (this.value == 'B') ? '' : 'none';
 			blockC.style.display = (this.value == 'C') ? '' : 'none';
+		});
+		elMode.addEventListener('change', function() {
+			bridgeBlock.style.display = (this.value == 'bridge') ? '' : 'none';
+			routerBlock.style.display = (this.value == 'router') ? '' : 'none';
 		});
 
 		var out = E('pre', { 'class': 'cbi-section', 'style': 'display: none; white-space: pre-wrap; font-size: smaller' });
@@ -233,16 +268,21 @@ return view.extend({
 		var applyBtn = E('button', {
 			'class': 'btn cbi-button cbi-button-apply important',
 			'click': ui.createHandlerFn(this, function() {
+				var mode = elMode.value;
 				var vlanEn = elVlanEn.checked;
 				var vlan = elVlan.value.trim();
-				var scheme = elScheme.value;
+				var scheme = (mode == 'router') ? 'none' : elScheme.value;
 				var mvid = elMgmtVlan.value.trim();
 				var mip = elMgmtIp.value.trim();
 				var mrtr = elMgmtRtr.value.trim();
+				var puser = elPppUser.value.trim();
+				var ppass = elPppPass.value;
 
 				var errors = [];
 				if (vlanEn && !validVid(vlan))
 					errors.push(_('运营商 VLAN 必须是 1..4094。'));
+				if (mode == 'router' && !puser)
+					errors.push(_('路由模式需要填写 PPPoE 用户名。'));
 				if (scheme == 'B') {
 					if (!validVid(mvid))
 						errors.push(_('管理 VLAN 必须是 1..4094。'));
@@ -264,6 +304,7 @@ return view.extend({
 					return Promise.resolve();
 				}
 
+				uci.set('ponwizard', 'config', 'op_mode', mode);
 				uci.set('ponwizard', 'config', 'bridged', elBridged.checked ? '1' : '0');
 				uci.set('ponwizard', 'config', 'port25', elPort25.value);
 				uci.set('ponwizard', 'config', 'wan_vlan_enabled', vlanEn ? '1' : '0');
@@ -272,6 +313,9 @@ return view.extend({
 				uci.set('ponwizard', 'config', 'mgmt_vlan', mvid);
 				uci.set('ponwizard', 'config', 'mgmt_ip', mip);
 				uci.set('ponwizard', 'config', 'mgmt_router_ip', mrtr);
+				uci.set('ponwizard', 'config', 'pppoe_user', puser);
+				uci.set('ponwizard', 'config', 'pppoe_pass', ppass);
+				uci.set('ponwizard', 'config', 'wan_ipv6', elIpv6.checked ? '1' : '0');
 
 				return uci.save()
 					.then(function() { return L.resolveDefault(fs.exec_direct(APPLY, [ 'apply' ]), null); })
@@ -291,20 +335,36 @@ return view.extend({
 				_('挂在 WAN 桥（或其运营商 VLAN 子接口）上的静态 IP，必须用新网段，如 192.168.9.0/24。')),
 			fieldRow(_('路由器虚拟 IP（方案 C）'), elMgmtRtr,
 				_('唯一允许访问管理端口的源地址；路由器侧 luci-app-ap-modem 插件里填同一个值。')));
-
-		return E('div', { 'class': 'cbi-section' }, [
-			E('h3', {}, _('期望配置')),
-
+		bridgeBlock.append(
 			fieldRow(_('桥接 2.5G 口给下游 PPPoE'), elBridged,
 				_('建立纯二层桥（光口 + 2.5G 口）并把 WAN 指向它、协议设为「无」。取消勾选不会拆除已有桥。')),
 			fieldRow(_('2.5G 口名称'), elPort25,
 				_('建桥时使用；已桥接的光猫会自动检测（换板子先在 SSH 里 ip -br link 确认）。')),
-			fieldRow(_('运营商 VLAN tag'), [ elVlanEn, ' ', elVlan ],
-				_('OLT 下发的上网业务带 tag 时勾选（如 3114）；2.5G 侧保持 untagged 给路由器 PPPoE。')),
-			fieldRow(_('管理访问方案'), elScheme),
-
+			fieldRow(_('管理访问方案'), elScheme,
+				_('下游路由器及其设备访问光猫管理页的方式；路由模式下管理页就是 LAN 页，无需选择。')),
 			blockB,
-			blockC,
+			blockC);
+		routerBlock.append(
+			fieldRow(_('PPPoE 用户名'), elPppUser,
+				_('运营商提供的宽带账号；密码明文保存在 /etc/config（与 OpenWrt 一致）。')),
+			fieldRow(_('PPPoE 密码'), elPppPass,
+				_('留空则沿用已保存的密码（检测到已配置账号时可不重填）。')),
+			fieldRow(_('IPv6（DHCPv6）'), elIpv6,
+				_('勾选后在 PPPoE 之上建立 wan6（dhcpv6，缺省开启）。')));
+
+		return E('div', { 'class': 'cbi-section' }, [
+			E('h3', {}, _('期望配置')),
+
+			fieldRow(_('工作模式'), elMode,
+				_('桥接 = 下游路由器拨号（2.5G 口透传）；路由 = 光猫自己拨号，无需下游路由器。')),
+
+			fieldRow(_('运营商 VLAN tag'), [ elVlanEn, ' ', elVlan ],
+				vOpMode == 'router'
+					? _('OLT 下发的上网业务带 tag 时勾选（如 3114），拨号走 pon0.<VLAN> 子接口。')
+					: _('OLT 下发的上网业务带 tag 时勾选（如 3114）；2.5G 侧保持 untagged 给路由器 PPPoE。')),
+
+			bridgeBlock,
+			routerBlock,
 
 			E('div', { 'class': 'cbi-page-actions' }, applyBtn),
 			out

@@ -3,6 +3,7 @@
 # 打开向导页时展示的是从实际配置检测出的状态（优先于本声明），避免两者不同步。
 
 config wizard 'config'
+	option op_mode 'bridge'
 	option bridged '0'
 	option port25 ''
 	option wan_vlan_enabled '0'
@@ -11,3 +12,6 @@ config wizard 'config'
 	option mgmt_vlan '2100'
 	option mgmt_ip '192.168.9.1'
 	option mgmt_router_ip '192.168.9.254'
+	option pppoe_user ''
+	option pppoe_pass ''
+	option wan_ipv6 '1'
