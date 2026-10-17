@@ -91,7 +91,7 @@ index d161df9dd..54d2a6d8b 100644
 +			 dev_name(eth->dev));
 +		return -ENAMETOOLONG;
 +	}
-+	eth->switch_id_len = err + 1;
++	eth->switch_id_len = err;
 +
  	err = dma_set_mask_and_coherent(eth->dev, DMA_BIT_MASK(32));
  	if (err) {
@@ -112,7 +112,7 @@ index 0cf3e4d8a..cd94f1683 100644
 + * ("1e660000.ethernet" on the AN7581) and the NUL terminator.
 + */
 +#define AIROHA_SWITCH_ID_PREFIX		"airoha"
-+#define AIROHA_SWITCH_ID_LEN		24
++#define AIROHA_SWITCH_ID_LEN		32
 +
  struct airoha_ppe {
  	struct airoha_ppe_dev dev;
