@@ -149,6 +149,11 @@ detect() {
 			;;
 		esac
 		D_USER="$(uget network.wan.username)"
+		# 千兆管理口从 br-lan 读（路由模式下即内网口；转桥接时方案 B 要用）
+		local gs
+		for gs in $(device_sections); do
+			[ "$(sec_name "$gs")" = "br-lan" ] && { D_GBE="$(sec_ports "$gs")"; break; }
+		done
 		return 0
 	}
 
@@ -418,6 +423,8 @@ ensure_bridged() {
 
 	uci set "network.wan.device=${D_PONNAME:-br-wan}"
 	uci set network.wan.proto='none'
+	udel network.wan.username
+	udel network.wan.password
 	udel network.wan6
 	udel network.ponwan   # 路由模式残留的 8021q 子接口
 	D_BRIDGED=1; D_PORT25="$p25"
@@ -466,9 +473,13 @@ apply_mgmt() {
 			&& die "VLAN $vid 已被其它 bridge-vlan 占用，请换 mgmt_vlan"
 		[ -n "$D_PONSEC" ] || die "未桥接且找不到运营商桥：请先在向导里勾选桥接"
 
-		# 千兆口并进运营商桥，管理 VLAN：2.5G 带 tag、千兆口剥 tag
-		local p gbe="$D_GBE"
-		[ -n "$gbe" ] || die "推断不出千兆管理口，无法应用方案 B"
+		# 千兆口并进运营商桥，管理 VLAN：2.5G 带 tag、千兆口剥 tag。
+		# 路由模式转来时 D_GBE 取自 br-lan，需剔除 2.5G 口（它以 t 加入）
+		local p gbe=""
+		for p in $D_GBE; do
+			[ "$p" = "$D_PORT25" ] || gbe="$gbe $p"
+		done
+		[ -n "$(echo $gbe)" ] || die "推断不出千兆管理口，无法应用方案 B"
 		uci set "network.$D_PONSEC.vlan_filtering"='1'
 		for p in $gbe; do
 			case " $(sec_ports "$D_PONSEC") " in *" $p "*) ;;
@@ -684,9 +695,17 @@ cmd_apply() {
 		echo "管理访问       : 无"
 	fi
 	echo "--- 声明目标 ---"
-	echo "桥接           : $([ "$(d_bridged)" = 1 ] && echo 确保 || echo 不变)"
+	if [ "$(d_opmode)" = "router" ]; then
+		echo "工作模式       : 路由（pppoe$(d_vlan_en | grep -q '^1$' && echo "@$D_PONPORT.$(d_vlan)")$(d_wan_pbit | grep -q '[0-9]' && echo " P-bit $(d_wan_pbit)")）"
+	else
+		echo "工作模式       : 桥接（$([ "$(d_bridged)" = 1 ] && echo 确保 || echo 不变)）"
+	fi
 	echo "运营商 VLAN    : $([ "$(d_vlan_en)" = 1 ] && echo "$(d_vlan)" || echo 无)"
-	echo "管理访问       : $(d_scheme)$([ "$(d_scheme)" = B ] && echo " ($(d_mgmt_vlan))")$([ "$(d_scheme)" = C ] && echo " ($(d_mgmt_ip) / $(d_mgmt_rtr))")"
+	if [ "$(d_opmode)" = "router" ]; then
+		echo "PPPoE          : $(d_pppoe_user)"
+	else
+		echo "管理访问       : $(d_scheme)$([ "$(d_scheme)" = B ] && echo " ($(d_mgmt_vlan))")$([ "$(d_scheme)" = C ] && echo " ($(d_mgmt_ip) / $(d_mgmt_rtr))")"
+	fi
 
 	if [ "$dry" = "1" ]; then
 		msg "--dry-run：未做任何改动"
@@ -702,9 +721,12 @@ cmd_apply() {
 	printf 'NET_BACKUP=%s\nFW_BACKUP=%s\nAPPLY_TS=%s\nAPPLY_TIMEOUT=%s\n' \
 		"$NET_BACKUP" "$FW_BACKUP" "$(date +%s)" "$TIMEOUT" > "$STATE"
 
+	# 无论是否武装新回滚，先清掉可能残留的旧回滚定时器：
+	# 否则旧定时器到点会把本次（甚至更晚的）应用成果一并回滚
+	rm -f "$KEEP_MARK"
+	kill_timer
+
 	if [ "$yes" != "1" ]; then
-		rm -f "$KEEP_MARK"
-		kill_timer
 		(
 			sleep "$TIMEOUT"
 			if [ -f "$KEEP_MARK" ]; then

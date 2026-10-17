@@ -3,8 +3,16 @@
 'require dom';
 'require fs';
 'require poll';
+'require rpc';
 'require ui';
 'require uci';
+
+/* uci.save() 只把变更写入 rpcd 的 pending delta，不会落盘；必须再调
+ * ubus uci apply（rollback=false 即等效 commit）让声明真正写入
+ * /etc/config，apply 后端才能读到最新值 */
+var callUciApply = rpc.declare({
+	object: 'uci', method: 'apply', params: [ 'rollback', 'timeout' ]
+});
 
 /* PON 接入向导：桥接 2.5G 口给下游 PPPoE、设置运营商 VLAN、选择管理访问
  * 方案（FLASHING.md 第 6 / 6.4 / 6.7 节）。表单按 pon-wizard-apply 报告的
@@ -327,6 +335,7 @@ return view.extend({
 				uci.set('ponwizard', 'config', 'wan_pbit', elPbit.value);
 
 				return uci.save()
+					.then(function() { return callUciApply(false, 0); })
 					.then(function() {
 						applyBtn.disabled = true;
 						ui.showModal(_('正在应用配置'), [
