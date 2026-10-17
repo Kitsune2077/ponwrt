@@ -1,0 +1,479 @@
+From: Kitsune <km2077@foxmail.com>
+Subject: [PATCH] net: airoha: support VLAN rewrite on bridge offload
+
+Stage 1 only offloads bridge flows whose egress port emits the FDB VID
+untagged. A VLAN-filtering bridge such as pon0:t (VLAN 3114 tagged) plus
+lan1:u* (untagged) therefore keeps the upstream direction in the software
+bridge even though the PPE can forward it.
+
+Teach the promote path to push an 802.1Q tag on the bridged egress. The
+egress action is resolved from the bridge when the FDB entry is added:
+br_vlan_get_info_rcu() gives the port membership and the untagged flag,
+br_vlan_get_pvid_rcu() gives the PVID. The template uses the same
+data.vlan/IB1 VLAN_LAYER fields as the netfilter FLOW_ACTION_VLAN_PUSH
+path, so the PPE writes vlan1 = VID and the frame leaves tagged.
+
+This is opt-in through the vlan_rewrite module parameter, default 0: an
+image can carry the code while stage-1 forwarding stays unchanged. When it
+is 1, untagged-in/tagged-out flows are offloaded and counted in
+fdb_stats.vlan_push. Same-VID tagged-in/tagged-out flows either keep the
+tag already in the packet (LAN egress only) or push it back when it only
+exists in the skb metadata; keeping the packet tag is excluded on PON
+egress because the GEM lookup needs a data->vlan entry, which would ask
+the PPE to push a second tag.
+
+Tag pop is not implemented. There is no strip/remove bit or TPID field in
+struct airoha_foe_l2b or the AIROHA_FOE_IB1/IB2 definitions, and the
+existing code treats FLOW_ACTION_VLAN_POP as a no-op. Tagged-in/
+untagged-out therefore still increments fdb_stats.vlan_pop and stays in
+software. The exact hardware question is documented next to the decision:
+does an L2B egress template with VLAN_LAYER=0 and empty vlan1/vlan2 strip
+the ingress tag, or does it leave it in the frame? No bit is invented
+here; that direction must be measured on a board first.
+
+The PON GEM/T-CONT resolution in patch 925 already uses the last entry of
+data->vlan, i.e. the egress VID. Filling data->vlan for a pushed tag is
+what makes a 3114 push resolve to the GEM configured for 3114; without it
+the lookup falls back to AIROHA_PON_VID_ANY. No change to 925 is needed,
+but the flow is only accepted when all eight P-bits resolve to one GEM, as
+before.
+
+The switchdev bridge helpers are compiled only when CONFIG_BRIDGE and
+CONFIG_BRIDGE_VLAN_FILTERING are reachable. A NET_AIROHA=y + BRIDGE=m +
+NET_DSA=n build would otherwise leave an unresolved br_vlan_get_*_rcu()
+symbol in vmlinux; with the guard it compiles and the push path simply
+stays disabled.
+
+The pushed tag is 802.1Q with PCP 0. br_vlan_get_info_rcu() does not
+expose a per-VLAN PCP and the netfilter path does not encode act->vlan.prio
+either (AIROHA_FOE_IB2_PCP is a single bit and is never set), so a non-zero
+PCP cannot be reproduced yet; measure it before enabling the parameter on
+a network that uses PCP.
+
+Signed-off-by: Kitsune <km2077@foxmail.com>
+---
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -606,6 +606,23 @@
+ 
+ 	struct airoha_fdb_key key;
+ 	struct net_device *egress;
++
++	/* Egress VLAN action, resolved when the FDB entry is added (and
++	 * refreshed on every promotion, because a bridge VLAN flag change does
++	 * not re-add the FDB entry). @vlan_proto is the bridge protocol in host
++	 * order; 0 means "not known / no VLAN filtering". @pcp is the PCP the
++	 * driver can reproduce, which is only 0 today: the bridge API exposes
++	 * no per-VLAN PCP and the PCP of a pushed tag comes from the per-packet
++	 * skb priority. See airoha_ppe_fdb_set_egress_vlan(). @egress_pvid is
++	 * recorded for diagnostics and future PVID-based decisions; the tag
++	 * action itself only needs @egress_untagged and @vlan_proto.
++	 */
++	u16 vlan_proto;
++	u8 egress_member:1;
++	u8 egress_untagged:1;
++	u8 egress_pvid:1;
++	u8 egress_pon:1;
++	u8 pcp:3;
+ };
+ 
+ struct airoha_wdma_info {
+@@ -767,7 +784,10 @@
+ 	struct {
+ 		unsigned long promoted;     /* L2 flows promoted from the FDB */
+ 		unsigned long no_entry;     /* no FDB entry for the destination */
+-		unsigned long vlan_rewrite; /* tag push/pop needed, see promote */
++		unsigned long vlan_rewrite; /* rewrite needed, left to software */
++		unsigned long vlan_push;    /* tag pushed by the PPE */
++		unsigned long vlan_pop;     /* pop needed, still software */
++		unsigned long vlan_skip;    /* unsupported rewrite, software */
+ 		unsigned long no_npu;       /* NPU not configured, promote skipped */
+ 	} fdb_stats;
+ 
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -57,6 +57,35 @@
+ MODULE_PARM_DESC(fdb_refresh_period,
+ 		 "Inspect the offloaded bridge FDB entries every N seconds (0 = off)");
+ 
++/* Opt-in VLAN tag push on the bridged egress.
++ *
++ * 0 (the default) keeps the stage-1 behaviour: only destinations whose
++ * egress bridge port emits the FDB VID untagged are offloaded. 1 additionally
++ * lets the PPE push an 802.1Q tag when an untagged frame arrives on an access
++ * port and leaves through a tagged port (e.g. lan1:u* -> pon0:t with VLAN
++ * 3114). Tag pop is not implemented (see the TODO in
++ * airoha_ppe_bridge_fdb_promote() and DEFECT-FIXES.md), so a tagged ingress
++ * frame with an untagged egress still stays in the software bridge even when
++ * this is enabled.
++ *
++ * The parameter exists because the L2B tag handling has not been validated on
++ * hardware. Keeping it 0 in an image ships the code without changing the
++ * forwarding of a bridge that worked with stage 1.
++ */
++static bool vlan_rewrite;
++module_param(vlan_rewrite, bool, 0644);
++MODULE_PARM_DESC(vlan_rewrite,
++		 "Allow the PPE to push 802.1Q tags on bridge egress (0 = off)");
++
++/* FDB statistics are approximate and can be lost on races, like the rest of
++ * the counters in this file; WRITE_ONCE() only keeps the compiler from
++ * merging or reordering them.
++ */
++static void airoha_ppe_fdb_stat_inc(unsigned long *counter)
++{
++	WRITE_ONCE(*counter, *counter + 1);
++}
++
+ static int airoha_ppe_get_num_stats_entries(struct airoha_ppe *ppe)
+ {
+ 	if (!IS_ENABLED(CONFIG_NET_AIROHA_FLOW_STATS))
+@@ -1213,35 +1242,77 @@
+ 	return 0;
+ }
+ 
+-/* True when a frame forwarded to @egress in @vid needs no VLAN tag rewrite,
+- * i.e. when the egress bridge port emits it untagged.
++/* Fill the cached egress VLAN action of @fdb, asking the bridge for the
++ * membership flags of @fdb->egress in @fdb->key.vid.
+  *
+  * vid 0 is the untagged domain used by a bridge without VLAN filtering (and
+- * by a VLAN-filtering bridge that has no PVID): there is no tag to add or
+- * strip. For a real VLAN, ask the bridge for the membership flags of the
+- * egress port; @egress is a bridge port here. The RCU variant is used because
+- * this runs in the RX path and may be called with ppe_lock held.
++ * by a VLAN-filtering bridge that has no PVID): no tag is added or removed.
++ * For a real VLAN, br_vlan_get_info_rcu() tells whether the port is a member
++ * and whether it emits the VID untagged; br_vlan_get_pvid_rcu() tells whether
++ * this is the port PVID. Both are RCU variants because this runs in the RX
++ * path with ppe_lock held.
++ *
++ * The bridge does not expose a per-VLAN PCP, and the PCP of a tag pushed by
++ * the software bridge comes from the per-packet skb priority, which a
++ * per-flow FOE cannot reproduce. @fdb->pcp is therefore fixed to 0: that is
++ * the TCI the bridge assigns to an untagged frame classified into a PVID,
++ * which is the only case this stage pushes a tag for. A non-zero PCP has to
++ * be measured on hardware. AIROHA_FOE_IB2_PCP is deliberately not touched:
++ * the netfilter offload path never sets it either and the header only has a
++ * single bit, not the 3-bit PCP value.
+  *
+- * TODO(AN7581 tag handling): the PPE L2B template built by
+- * airoha_ppe_bridge_fdb_promote() always clears the egress VLAN fields, so
+- * only "untagged in, untagged out" can be expressed. Pushing a tag for a
+- * tagged @vid or popping one from a tagged ingress frame needs hardware
+- * validation (airoha_ppe_foe_entry_prepare() only records tags coming from
+- * FLOW_ACTION_VLAN_PUSH actions, and the driver treats FLOW_ACTION_VLAN_POP
+- * as a no-op). AIROHA_FOE_IB2_PCP exists in the FOE as well, but the offload
+- * path drops act->vlan.prio today, so the PCP cannot be reproduced either.
++ * The code is compiled out when the bridge (or its VLAN filtering) is a
++ * module and this driver is built-in: calling br_vlan_get_*_rcu() would then
++ * leave an unresolved symbol in vmlinux. In that configuration an FDB VID is
++ * never set up, so treating a non-zero VID as "not a member" only disables
++ * the new push path and keeps the frame in software.
+  */
+-static bool airoha_ppe_fdb_vlan_is_untagged(struct net_device *egress, u16 vid)
++static void airoha_ppe_fdb_set_egress_vlan(struct airoha_fdb_entry *fdb)
+ {
+-	struct bridge_vlan_info vinfo;
++	struct airoha_gdm_dev *gdm = netdev_priv(fdb->egress);
+ 
+-	if (!vid)
+-		return true;
++	fdb->vlan_proto = 0;
++	fdb->egress_member = true;
++	fdb->egress_untagged = true;
++	fdb->egress_pvid = true;
++	fdb->egress_pon = !!(gdm->flags & AIROHA_PRIV_F_PON);
++	fdb->pcp = 0;
+ 
+-	if (br_vlan_get_info_rcu(egress, vid, &vinfo))
+-		return false;
++	if (!fdb->key.vid)
++		return;
++
++	fdb->egress_member = false;
++	fdb->egress_untagged = false;
++	fdb->egress_pvid = false;
++
++#if IS_REACHABLE(CONFIG_BRIDGE) && IS_REACHABLE(CONFIG_BRIDGE_VLAN_FILTERING)
++	{
++		struct bridge_vlan_info vinfo;
++		struct net_device *master;
++		u16 pvid;
++
++		rcu_read_lock();
++
++		if (!br_vlan_get_info_rcu(fdb->egress, fdb->key.vid, &vinfo)) {
++			fdb->egress_member = true;
++			fdb->egress_untagged =
++				!!(vinfo.flags & BRIDGE_VLAN_INFO_UNTAGGED);
++		}
+ 
+-	return vinfo.flags & BRIDGE_VLAN_INFO_UNTAGGED;
++		if (!br_vlan_get_pvid_rcu(fdb->egress, &pvid))
++			fdb->egress_pvid = pvid == fdb->key.vid;
++
++		/* The bridge protocol is a property of the bridge master, not of
++		 * the port. A non-802.1Q protocol cannot be encoded in the FOE
++		 * template used below, so a failed lookup leaves vlan_proto 0.
++		 */
++		master = netdev_master_upper_dev_get_rcu(fdb->egress);
++		if (master && netif_is_bridge_master(master))
++			br_vlan_get_proto(master, &fdb->vlan_proto);
++
++		rcu_read_unlock();
++	}
++#endif
+ }
+ 
+ /* Drop the L2 flows promoted from @fdb and invalidate their FOE entries.
+@@ -1321,8 +1392,9 @@
+ 	struct airoha_fdb_key key;
+ 	struct net_device *egress;
+ 	struct ethhdr *eh = eth_hdr(skb);
+-	bool tagged;
+-	u16 vid;
++	bool ingress_tagged, tag_in_packet = false, push = false;
++	bool ingress_8021q = true;
++	u16 vid = 0;
+ 	int err;
+ 
+ 	/* airoha_ppe_foe_commit_entry() returns -ENODEV until the NPU has been
+@@ -1331,7 +1403,7 @@
+ 	 * yet: leave the frame to the software bridge and count it.
+ 	 */
+ 	if (!rcu_access_pointer(ppe->eth->npu)) {
+-		WRITE_ONCE(ppe->fdb_stats.no_npu, ppe->fdb_stats.no_npu + 1);
++		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.no_npu);
+ 		return;
+ 	}
+ 
+@@ -1345,36 +1417,57 @@
+ 	 * classified into the PVID of its ingress bridge port (0 when the port
+ 	 * is not a VLAN-filtering bridge port); a tagged frame carries its own
+ 	 * VID, either in the packet or in the skb metadata when the tag was
+-	 * offloaded. v1 only offloads the fully untagged case, see below.
++	 * offloaded. A priority-tagged frame (VID 0) is classified into the
++	 * PVID by the bridge, which would need a tag rewrite to the PVID here;
++	 * leave that rare case to software instead of guessing.
+ 	 */
+ 	rcu_read_lock();
+ 	if (skb_vlan_tag_present(skb)) {
+ 		vid = skb_vlan_tag_get_id(skb);
+-		tagged = true;
++		ingress_tagged = true;
++		ingress_8021q = skb->vlan_proto == htons(ETH_P_8021Q);
+ 	} else if (skb->protocol == htons(ETH_P_8021Q) ||
+ 		   skb->protocol == htons(ETH_P_8021AD)) {
++		struct vlan_ethhdr vh;
++		const struct vlan_ethhdr *header;
++		u16 tci;
++
+ 		/* The tag is still in the packet: this driver does not strip it
+-		 * on RX, so the frame is tagged as well.
++		 * on RX, so the frame is tagged as well. Read the VID from the
++		 * packet because the FDB is keyed by it.
+ 		 */
+-		vid = 0;
+-		tagged = true;
++		ingress_tagged = true;
++		tag_in_packet = true;
++		ingress_8021q = skb->protocol == htons(ETH_P_8021Q);
++		header = skb_header_pointer(skb, 0, sizeof(vh), &vh);
++		if (!header) {
++			rcu_read_unlock();
++			/* Cannot even read the VID: leave it to software. */
++			airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.vlan_skip);
++			airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.vlan_rewrite);
++			return;
++		}
++		tci = ntohs(header->h_vlan_TCI);
++		vid = tci & VLAN_VID_MASK;
+ 	} else {
+-		u16 pvid;
++		ingress_tagged = false;
++#if IS_REACHABLE(CONFIG_BRIDGE) && IS_REACHABLE(CONFIG_BRIDGE_VLAN_FILTERING)
++		{
++			u16 pvid;
+ 
+-		vid = 0;
+-		if (!br_vlan_get_pvid_rcu(skb->dev, &pvid))
+-			vid = pvid;
+-		tagged = false;
++			if (!br_vlan_get_pvid_rcu(skb->dev, &pvid))
++				vid = pvid;
++		}
++#endif
+ 	}
+ 	rcu_read_unlock();
+ 
+-	/* A tagged ingress frame needs a tag pop and a tagged egress port needs
+-	 * a tag push; neither can be expressed on the PPE L2B entry yet. Leave
+-	 * the frame to the software bridge, visibly.
+-	 */
+-	if (tagged) {
+-		WRITE_ONCE(ppe->fdb_stats.vlan_rewrite,
+-			   ppe->fdb_stats.vlan_rewrite + 1);
++	if (ingress_tagged && !vid) {
++		/* Priority tag: the bridge would classify it into the PVID and
++		 * rewrite the tag; not supported here.
++		 */
++		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.vlan_skip);
++		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.vlan_rewrite);
+ 		return;
+ 	}
+ 
+@@ -1403,18 +1496,99 @@
+ 		goto out_unlock_mutex;
+ 	}
+ 
+-	/* The key is the VID the bridge learned the destination in, so the
+-	 * egress port must emit that VID untagged for the frame to need no tag
+-	 * rewrite. Otherwise keep it in software, visibly.
++	/* Resolve the egress action from the bridge membership. The flags are
++	 * cached in the FDB entry at add time, but a VLAN flag change (tagged
++	 * <-> untagged) does not re-add the FDB entry and 932 ignores the
++	 * per-port VLAN notifications, so refresh them here while the bridge
++	 * data is still reachable under RCU.
++	 *
++	 * TODO(AN7581 tag pop): no strip/remove bit, TPID field or "remove
++	 * tag" flag exists in struct airoha_foe_l2b or the AIROHA_FOE_IB1/
++	 * IB2 definitions. The exact question a hardware test has to answer
++	 * is: does an L2B egress template with IB1_VLAN_LAYER=0, VPM=0 and
++	 * vlan1/vlan2=0 strip the ingress 802.1Q tag (in which case pop is
++	 * already expressible by leaving the VLAN fields clear), or does it
++	 * leave the original tag in the frame (in which case a strip bit must
++	 * be found in IB1/IB2 or in a GDM/PPE register)? The same question
++	 * gates tagged-in/tagged-out with the same VID, which assumes the
++	 * packet's tag is left untouched. Until it is answered, both the pop
++	 * case and the tag-keep case stay in the software bridge.
+ 	 */
+-	rcu_read_lock();
+-	tagged = !airoha_ppe_fdb_vlan_is_untagged(fdb->egress, vid);
+-	rcu_read_unlock();
+-	if (tagged) {
+-		WRITE_ONCE(ppe->fdb_stats.vlan_rewrite,
+-			   ppe->fdb_stats.vlan_rewrite + 1);
++	airoha_ppe_fdb_set_egress_vlan(fdb);
++
++	if (!fdb->egress_member) {
++		/* The FDB VID is not a member of the egress port: pushing it
++		 * would be wrong.
++		 */
++		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.vlan_skip);
++		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.vlan_rewrite);
++		spin_unlock_bh(&ppe_lock);
++		goto out_unlock_mutex;
++	}
++
++	if (!ingress_tagged) {
++		if (fdb->egress_untagged) {
++			/* Untagged in, untagged out: no rewrite, the stage-1
++			 * path, unchanged.
++			 */
++		} else if (!vlan_rewrite || fdb->vlan_proto != ETH_P_8021Q) {
++			/* A push is needed but disabled, or the egress tag is
++			 * not 802.1Q: leave it to the software bridge.
++			 */
++			airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.vlan_skip);
++			airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.vlan_rewrite);
++			spin_unlock_bh(&ppe_lock);
++			goto out_unlock_mutex;
++		} else {
++			push = true;
++		}
++	} else if (fdb->egress_untagged) {
++		/* Tagged in, untagged out: a tag pop. Not implemented, see
++		 * the TODO above. Count it separately so that a hardware test
++		 * can see whether pop is the only direction left in software.
++		 */
++		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.vlan_pop);
++		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.vlan_rewrite);
++		spin_unlock_bh(&ppe_lock);
++		goto out_unlock_mutex;
++	} else if (vid != fdb->key.vid || !ingress_8021q ||
++		   fdb->vlan_proto != ETH_P_8021Q) {
++		/* Tagged in, tagged out with a different VID or TPID: the FOE
++		 * can keep or insert a tag, not rewrite one. Explicitly out of
++		 * scope for this stage.
++		 */
++		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.vlan_skip);
++		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.vlan_rewrite);
++		spin_unlock_bh(&ppe_lock);
++		goto out_unlock_mutex;
++	} else if (!vlan_rewrite) {
++		/* Same VID and TPID, but every new tag path stays behind the
++		 * module parameter so that an image can keep stage-1
++		 * behaviour.
++		 */
++		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.vlan_skip);
++		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.vlan_rewrite);
+ 		spin_unlock_bh(&ppe_lock);
+ 		goto out_unlock_mutex;
++	} else if (tag_in_packet) {
++		/* Same VID, tag still in the packet: nothing to do if the
++		 * PPE leaves the packet's tag alone (the hw question above).
++		 * A PON egress additionally needs the VID for the GEM/T-CONT
++		 * lookup, which is only derived from data->vlan; filling it
++		 * would also ask the PPE to push a second tag, so keep PON in
++		 * software for now.
++		 */
++		if (fdb->egress_pon) {
++			airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.vlan_skip);
++			airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.vlan_rewrite);
++			spin_unlock_bh(&ppe_lock);
++			goto out_unlock_mutex;
++		}
++	} else {
++		/* Tag only in skb metadata: the packet is untagged in memory,
++		 * so push it back with the egress VID.
++		 */
++		push = true;
+ 	}
+ 
+ 	egress = fdb->egress;
+@@ -1424,6 +1598,17 @@
+ 	memcpy(data.eth.h_dest, eh->h_dest, ETH_ALEN);
+ 	memcpy(data.eth.h_source, eh->h_source, ETH_ALEN);
+ 
++	if (push) {
++		/* Same encoding the netfilter FLOW_ACTION_VLAN_PUSH path uses:
++		 * VID in vlan1, IB1 VLAN_LAYER/VPM = 1. The FOE header has no
++		 * TPID or PCP value field, so the pushed tag is 802.1Q with
++		 * PCP 0; fdb->pcp is 0 for the same reason.
++		 */
++		data.vlan.hdr[0].id = fdb->key.vid;
++		data.vlan.hdr[0].proto = htons(ETH_P_8021Q);
++		data.vlan.num = 1;
++	}
++
+ 	err = airoha_ppe_foe_entry_prepare(ppe->eth, &hwe, egress,
+ 					   PPE_PKT_TYPE_BRIDGE, &data, 0, 0,
+ 					   &egress_dev);
+@@ -1477,7 +1662,9 @@
+ 
+ 	list_add_tail(&e->fdb_node, &fdb->flows);
+ 	e = NULL;
+-	WRITE_ONCE(ppe->fdb_stats.promoted, ppe->fdb_stats.promoted + 1);
++	if (push)
++		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.vlan_push);
++	airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.promoted);
+ 
+ out_free:
+ 	spin_unlock_bh(&ppe_lock);
+@@ -1563,6 +1750,12 @@
+ 	fdb->key = key;
+ 	fdb->egress = egress;
+ 
++	/* Cache the egress tag action now, while the bridge port is known to
++	 * be linked. It is refreshed in the promote path as well; see
++	 * airoha_ppe_fdb_set_egress_vlan().
++	 */
++	airoha_ppe_fdb_set_egress_vlan(fdb);
++
+ 	spin_lock_bh(&ppe_lock);
+ 
+ 	err = rhashtable_lookup_insert_fast(&ppe->fdb_table, &fdb->node,
