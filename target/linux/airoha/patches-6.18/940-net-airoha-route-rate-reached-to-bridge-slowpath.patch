@@ -1,0 +1,166 @@
+From: Kitsune <km2077@foxmail.com>
+Subject: [PATCH] net: airoha: promote bridged flows on HIT_UNBIND_RATE_REACHED
+
+The HG5382A CPU-reason histogram after a controlled 300-frame
+lan3(DSA) -> lan1(GDM) bridged test is 0x0f +223, 0x0e +90, 0x0d +25 and
+zero for every other reason. 0x0f is the PPE telling the CPU that it has
+learned the L2B key of the flow, the flow reached the bind rate and the
+CPU should bind it. The RX dispatch still sent it to
+airoha_ppe_check_skb(), the sub-flow path that only commits flows which
+already have an l2_flows entry, so the bridge flow was never promoted and
+fdb_promoted stayed 0.
+
+Choose the handler before calling either one. For 0x0f, use
+airoha_ppe_bridge_rx_slowpath() when the frame is a bridged unicast
+candidate: the ingress is a bridge port (or a DSA conduit), the
+destination is not multicast, the NPU is attached, the bridge FDB maps
+the destination MAC/VID to a valid airoha GDM egress different from the
+ingress, and the egress action needs no VLAN rewrite. Everything else
+keeps the existing airoha_ppe_check_skb() behaviour unchanged. Exactly
+one handler is called per frame, so one frame cannot be committed by
+both paths.
+
+The ownership gate is not relaxed: the slow path still checks the range,
+the BIND state, the native/software layout and the hardware-learned key
+under ppe_lock, and the RANGE/NO_ENTRY/BIND/TYPE/KEY/ACCEPTED counters
+keep rejecting and counting foreign entries.
+
+This is 940-net-airoha-route-rate-reached-to-bridge-slowpath.patch.
+
+Signed-off-by: Kitsune <km2077@foxmail.com>
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 9970ac69b..ad8e96ad2 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1089,11 +1089,20 @@ static int airoha_qdma_rx_process(struct airoha_queue *q, int budget)
+ 			atomic64_inc(&eth->ppe->rx_reason_count[reason]);
+ 		switch (reason) {
+ 		case AIROHA_PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED:
+-			/* The PPE already learned the L2B key of this flow and
+-			 * wants the CPU to bind it: this is the original path.
++			/* The PPE learned the L2B key of this flow and wants
++			 * the CPU to bind it. A bridged unicast whose egress is
++			 * known to the FDB is promoted by the bridge slow path;
++			 * every other flow keeps the original sub-flow path.
++			 * The candidate test performs the eligibility checks
++			 * before either path runs, and exactly one of them is
++			 * called, so a frame is never committed twice.
+ 			 */
+-			airoha_ppe_check_skb(&eth->ppe->dev, q->skb, hash,
+-					     false);
++			if (airoha_ppe_bridge_rx_is_candidate(eth, q->skb))
++				airoha_ppe_bridge_rx_slowpath(eth, q->skb,
++							      hash, reason);
++			else
++				airoha_ppe_check_skb(&eth->ppe->dev, q->skb,
++						     hash, false);
+ 			break;
+ 		case AIROHA_PPE_CPU_REASON_NO_FLOW:
+ 		case AIROHA_PPE_CPU_REASON_UN_HIT:
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index f06ead82c..16fa642fa 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -1052,6 +1052,8 @@ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 			  u16 hash, bool rx_wlan);
+ void airoha_ppe_bridge_rx_slowpath(struct airoha_eth *eth,
+ 				   struct sk_buff *skb, u32 hash, u32 reason);
++bool airoha_ppe_bridge_rx_is_candidate(struct airoha_eth *eth,
++				       struct sk_buff *skb);
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data);
+ int airoha_ppe_init(struct airoha_eth *eth);
+ void airoha_ppe_deinit(struct airoha_eth *eth);
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index c1ca74b4d..0d28b965b 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1958,6 +1958,88 @@ static void airoha_ppe_l2b_dbg_log_config(struct airoha_ppe *ppe)
+ 	}
+ }
+ 
++/**
++ * airoha_ppe_bridge_rx_is_candidate() - is a 0x0f frame a bridge candidate?
++ * @eth: airoha ethernet device
++ * @skb: frame handed to the CPU by the PPE
++ *
++ * HIT_UNBIND_RATE_REACHED is the only reason both paths can handle: the
++ * original airoha_ppe_check_skb() path for an already-known sub-flow and
++ * the bridge slow path for a bridged unicast flow. Decide before calling
++ * either path, so that one frame is never processed by both.
++ *
++ * A candidate must come from a bridge port (or a DSA conduit, whose user
++ * port is the actual bridge port), be a unicast destination, have the NPU
++ * attached and have a bridge FDB entry for the destination MAC/VID whose
++ * egress is a valid airoha GDM netdev, different from the ingress. Only
++ * the untagged-in/untagged-out action is accepted: a tag push, pop or
++ * keep needs the VLAN rewrite decision and stays on the original path.
++ *
++ * The check is intentionally cheap and racy: the slow path and the promote
++ * function repeat the ownership and VLAN checks under ppe_lock before any
++ * FOE write.
++ *
++ * Return: true when airoha_ppe_bridge_rx_slowpath() is the path to use.
++ */
++bool airoha_ppe_bridge_rx_is_candidate(struct airoha_eth *eth,
++				       struct sk_buff *skb)
++{
++	struct airoha_ppe *ppe = eth->ppe;
++	struct airoha_fdb_entry *fdb;
++	struct airoha_fdb_key key;
++	struct ethhdr *eh;
++	bool ret = false;
++	u16 vid = 0;
++
++	if (!ppe || !skb || !skb->dev)
++		return false;
++
++	if (!netif_is_bridge_port(skb->dev) && !netdev_uses_dsa(skb->dev))
++		return false;
++
++	eh = eth_hdr(skb);
++	if (!eh || is_multicast_ether_addr(eh->h_dest))
++		return false;
++
++	if (!rcu_access_pointer(eth->npu))
++		return false;
++
++	/* Only the stage-1 no-rewrite action is eligible. */
++	if (skb_vlan_tag_present(skb) ||
++	    skb->protocol == htons(ETH_P_8021Q) ||
++	    skb->protocol == htons(ETH_P_8021AD))
++		return false;
++
++	rcu_read_lock();
++#if IS_REACHABLE(CONFIG_BRIDGE) && IS_REACHABLE(CONFIG_BRIDGE_VLAN_FILTERING)
++	{
++		u16 pvid;
++
++		if (!br_vlan_get_pvid_rcu(skb->dev, &pvid))
++			vid = pvid;
++	}
++#endif
++	rcu_read_unlock();
++
++	ether_addr_copy(key.addr, eh->h_dest);
++	key.vid = vid;
++
++	spin_lock_bh(&ppe_lock);
++	fdb = rhashtable_lookup_fast(&ppe->fdb_table, &key,
++				     airoha_fdb_table_params);
++	if (fdb && fdb->egress != skb->dev) {
++		/* Refresh the cached action exactly like the promote path:
++		 * a tagged/untagged change does not re-add the FDB entry.
++		 */
++		airoha_ppe_fdb_set_egress_vlan(fdb);
++		ret = fdb->egress_member && fdb->egress_untagged &&
++		      airoha_is_valid_gdm_dev(eth, netdev_priv(fdb->egress));
++	}
++	spin_unlock_bh(&ppe_lock);
++
++	return ret;
++}
++
+ /**
+  * airoha_ppe_bridge_rx_slowpath() - promote a bridged frame the PPE punted
+  * @eth: airoha ethernet device

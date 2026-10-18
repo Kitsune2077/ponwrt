@@ -738,3 +738,76 @@ cat /sys/kernel/debug/ppe/l2b_dbg
   `airoha_ppe_debugfs.c:246`).
 - The image is built by the normal `make target/install` flow, not
   repacked.
+
+## Stage 7 — 940: route HIT_UNBIND_RATE_REACHED to the bridge slow path
+
+`940-net-airoha-route-rate-reached-to-bridge-slowpath.patch` (md5
+`2150ac709f98d93065064a91cb2da2fb`) changes only the RX CPU-reason dispatch
+and adds a read-only eligibility test. It does not change the FOE/PPE layout,
+the ownership gate or the promote path.
+
+### Measured trigger
+
+On the HG5382A, a controlled 300-frame bridged test (lan3 DSA -> lan1 GDM,
+all 300 frames forwarded by software) produced this CPU-reason histogram
+delta:
+
+| Reason | Delta |
+| --- | --- |
+| `0x0f` HIT_UNBIND_RATE_REACHED | +223 |
+| `0x0e` HIT_UNBIND | +90 |
+| `0x0d` UN_HIT | +25 |
+| everything else | +0 |
+
+`0x0f` is the hardware saying that the flow reached the minimum PPS and
+should be bound. In 936's dispatch it still went to
+`airoha_ppe_check_skb()`, the sub-flow path; the bridge RX slow path and its
+938 gate were never entered for these frames, so `fdb_promoted` stayed 0.
+The `l2b_dbg` ring independently confirmed that ambient IPv4-kind entries at
+the L2B MAC offsets are rejected by the `KEY` ownership check, so the gate
+itself is correct.
+
+### What 940 changes
+
+- `airoha_eth.c` 0x0f case: call `airoha_ppe_bridge_rx_is_candidate()`
+  first. If it returns true, `airoha_ppe_bridge_rx_slowpath()` handles the
+  frame; otherwise the original `airoha_ppe_check_skb()` path runs
+  unchanged. The `if`/`else` calls exactly one handler, so a frame is never
+  processed by both.
+- New `airoha_ppe_bridge_rx_is_candidate()` in `airoha_ppe.c`, declared in
+  `airoha_eth.h`. It writes nothing and checks:
+  - the ingress is a bridge port or a DSA conduit;
+  - the destination is unicast;
+  - the NPU is attached;
+  - the bridge FDB maps the destination MAC/VID to a valid airoha GDM
+    egress different from the ingress;
+  - the egress action is untagged-in/untagged-out, i.e. it needs no VLAN
+    rewrite.
+  It refreshes the cached egress VLAN flags under `ppe_lock`, like the
+  promote path, but does not count or promote anything.
+- The slow-path ownership gate is untouched: range, BIND state, native or
+  software layout, MAC key, and the
+  RANGE/NO_ENTRY/BIND/TYPE/KEY/ACCEPTED counters. A foreign slot still
+  increments its reject counter and the frame stays in software. If the FDB
+  test passes but the slot is foreign, the frame goes to the slow path (and
+  is rejected there), not to `airoha_ppe_check_skb()`, so it cannot be
+  committed twice.
+- Non-bridge 0x0f flows (routed/nft, non-candidate bridge ports, tagged or
+  rewrite cases, no NPU) keep the previous behaviour.
+
+### Verification of 940
+
+- Applies after 931 -> 939 on a clean `553902f58` worktree with
+  `git apply --check`/`git apply` rc=0; the resulting `airoha_eth.c`,
+  `airoha_eth.h` and `airoha_ppe.c` are byte-identical to the edited
+  `tree-940-apply`, with no `.rej`.
+- Driver compile in both configurations: `CONFIG_A_BUILD_RC=0`
+  (`NET_AIROHA=m`/`NET_DSA=m`) and `CONFIG_B_BUILD_RC=0`
+  (`NET_AIROHA=y`/`NET_DSA=y`/`HSR=n`); only the two pre-existing warnings
+  (`pcs-airoha-common.c:1426` and `airoha_ppe_debugfs.c:246`).
+- The image is built by the normal `make target/install` flow, not
+  repacked, from the committed patch on this branch.
+- Not verified on hardware: whether the 300-frame test now raises
+  `fdb_promoted` and creates a BRIDGE entry. That is the next board step;
+  `fdb_rx_no_flow` and `fdb_promoted` should both rise and `l2b_dbg`'s
+  ACCEPTED counter should become non-zero.
