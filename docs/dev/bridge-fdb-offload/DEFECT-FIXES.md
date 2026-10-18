@@ -436,3 +436,130 @@ lan3(DSA)→lan1(GDM) test would skip every frame at the first check.
   reported index. If it does, `rx_no_flow` and `promoted` rise; if the slot
   is absent, `rx_no_slot` rises and the frame stays in software. That is the
   first thing to read from a new build on the HG5382A.
+
+## Stage 4 — diagnostic 937: where did the L2B slot go?
+
+`937-net-airoha-add-l2b-slow-path-diagnostics.patch` (md5
+`ff7d1b4bde9250f059a8d8715aa4c4c1`) is **instrumentation only**. It does
+not build or commit an FOE entry, does not write a PPE register, and does
+not change the forwarding decision. The frames still go to the software
+bridge exactly as in 936.
+
+### The self-build plan was a category error
+
+The first 937 draft was going to build a native `struct airoha_foe_l2b`
+from the frame and commit it at a hash computed by
+`airoha_ppe_foe_get_entry_hash()`. The tree shows that is not how a
+bridge flow reaches this PPE:
+
+- `airoha_ppe_foe_flow_commit_entry()` sends `PPE_PKT_TYPE_BRIDGE` to the
+  software `l2_flows` rhashtable *before* computing any hash
+  (`airoha_ppe.c:1236-1237`); the only hardware commit of a bridge entry
+  is `airoha_ppe_foe_commit_subflow_entry()` at the descriptor's
+  `AIROHA_RXD4_FOE_ENTRY` index (`:1057-1120`). On AN7581 that function
+  preserves the learned native key and only copies `data`, `ib2`,
+  `vlan1`, `vlan2` and `etype` (`:1082-1089`).
+- The `PPE_PKT_TYPE_BRIDGE` case of `airoha_ppe_foe_get_entry_hash()`
+  (`:730-741`) only selects a *software* `foe_flow[]` bucket in the
+  non-7581 insert path (`:1162`); it is not a hardware L2B slot
+  allocator. There are no "software-installed native L2B entries" to
+  copy the hash from.
+- The native `l2b.key` at entry offset 12 (`struct airoha_foe_l2b`,
+  `airoha_eth.h:392-409`, offsets asserted at `:498-502`) is learned by
+  the hardware. The driver never writes it; 930 deliberately preserves
+  it. No writer, formula, register or test dump in the tree defines it.
+  A self-built entry would have to invent the one field the hardware
+  compares against the packet.
+
+This matches the design note of the MediaTek PPE this block derives from
+(Felix Fietkau, "support creating mac address based offload entries"):
+the hardware creates the L2 flow entry for bridged frames as well, tells
+the CPU when the flow reaches the offload rate, and software fills in the
+output/egress information. Software does not fabricate the L2 entry.
+
+The diagnostic below exists to find out why the hardware-created entry is
+missing on the HG5382A, not to work around it.
+
+### What 937 records (read-only)
+
+- The first 32 frames the gate refuses are kept in a fixed array filled
+  from the RX softirq (no allocation, no descriptor or FOE writes). Each
+  record has: descriptor `AIROHA_RXD4_FOE_ENTRY` index, raw
+  `AIROHA_RXD4_PPE_CPU_REASON`, raw `ib1`, the raw word at the native L2B
+  `ib2` offset (entry offset 44), the parsed `state`/`type`, the
+  `bridge` bit, the ingress `ifindex`, the jiffies and the rejection
+  reason (`RANGE`, `NO_ENTRY`, `BIND`, `TYPE`).
+- A 32-entry histogram of the raw CPU reason, incremented for every GDM
+  RX descriptor before the reason is dispatched. A wrong reason encoding
+  now shows up instead of silently going to software.
+- One `dev_info` per attach (bit-guarded) with `npu_attached`, `num_ppe`,
+  and per PPE: `REG_PPE_UNBIND_AGE` (0x238) raw + `MIN_PACKETS`/`DELTA`,
+  `REG_PPE_BIND_RATE` (`L2B_BIND`/`BIND`), `REG_PPE_TB_CFG`
+  (`SEARCH_MISS`), `REG_PPE_TB_HASH_CFG` and `REG_PPE_HASH_SEED`.
+- The same read-only registers in `/sys/kernel/debug/ppe/config` and the
+  records/histogram in the new `/sys/kernel/debug/ppe/l2b_dbg`.
+
+### The UNBIND_AGE gap
+
+`airoha_ppe_hw_init()` programs `PPE_TB_HASH_CFG`, `PPE_TB_CFG` and
+`PPE_BIND_RATE`, but it never writes `REG_PPE_UNBIND_AGE` (0x238). The
+MediaTek PPE of the same lineage sets `MIN_PACKETS=1000` and `DELTA=3`
+there. The AN7581 value printed by this patch is whatever the
+bootloader/firmware left behind. If it is 0 or very small, an unbound
+entry can age out before the CPU reads it, which would produce
+`rx_no_slot ≈ rx_no_flow` without any hash or key problem. This round is
+read-only: 937 does not write the register.
+
+### What to read on the board
+
+After the runbook traffic (lan3 DSA → lan1 GDM, 300 unicast frames):
+
+```sh
+cat /sys/kernel/debug/ppe/l2b_dbg
+cat /sys/kernel/debug/ppe/config | grep -E \
+    'npu_attached|fdb_|unbind_age|bind_rate|hash_cfg'
+dmesg | grep -E 'PPE diagnostic|PPE[01]:'
+cat /sys/kernel/debug/ppe/entries | grep -i l2b
+```
+
+How to read the first `l2b_dbg` records:
+
+| Observation | Meaning | Next step |
+| --- | --- | --- |
+| `hash=ffff reject=RANGE` for all frames | descriptor index is the invalid sentinel: hardware built no slot | inspect `unbind_age`, `bind_rate`, `tb_cfg.search_miss`; likely a PPE config issue |
+| valid `hash`, `reject=TYPE`, `type` ≠ 2 | hardware built an entry of another type at that index | check how the ingress path classifies the frame (L2 vs L3) |
+| valid `hash`, `type=2`, `reject=BIND` | the slot is already bound | not a slow-path candidate; look at `fdb_promoted`/entries |
+| valid `hash`, `type=2`, no reject | the gate accepted the slot and called promote | if `promoted` stays 0, the failure is in the FDB/VLAN side |
+| `reason[0x07]` not the dominant index | the assumed no-flow reason is wrong | use the histogram to find the real reason |
+| `unbind_age=00000000` | hardware has no unbound ageing configuration | candidate one-line follow-up: program `MIN_PACKETS`/`DELTA` |
+
+### What still must be confirmed on hardware
+
+- Whether the AN7581 PPE builds an L2B entry for bridged frames at all,
+  and at which descriptor index it reports it.
+- Which CPU reason the AN7581 uses for the first bridged frame (the
+  histogram answers this; 0x07/0x0d/0x0e/0x1a were inherited from the
+  MediaTek lineage and were never measured on this SoC).
+- Whether `REG_PPE_UNBIND_AGE` is nonzero and whether the hardware ages
+  the unbound entry out before NAPI runs.
+- Native `l2b.key` semantics, if a self-build is ever revisited: the
+  field is still not defined by the tree.
+
+### Fallback (unchanged)
+
+Plan B remains per-MAC IPv4/IPv6 tc-flower rules through the normal
+flow-offload slot allocation, which uses the software hash/slot path that
+is already exercised by routed offload. It does not need `l2b.key`. It
+should only be attempted after the diagnostic shows that the hardware
+L2B path cannot be made to create the slot.
+
+### Verification of 937
+
+- Applies after 931→936 on a clean `553902f58` worktree with
+  `git apply --check`/`git apply` rc=0 (tree `~/kbuild/tree-937-apply`).
+- Driver compile in both configurations: `CONFIG_A_BUILD_RC=0` and
+  `CONFIG_B_BUILD_RC=0`; only the same two pre-existing warnings
+  (`pcs-airoha-common.c:1426` and the `ppe%u_gdm2_default_cpu_port`
+  format warning, now at `airoha_ppe_debugfs.c:246`).
+- No hardware write, no new commit path and no change to `fdb_stats`;
+  the first 32 rejects and the reason histogram are the only new state.

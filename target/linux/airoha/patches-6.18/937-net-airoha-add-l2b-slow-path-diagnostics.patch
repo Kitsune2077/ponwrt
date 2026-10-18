@@ -1,0 +1,472 @@
+From: Kitsune <km2077@foxmail.com>
+Subject: [PATCH] net: airoha: add L2B slow-path diagnostics
+
+936 makes the bridge RX slow path observable through two counters, but
+not through the data that decides whether the PPE left an unbound L2B
+entry: 3357 of 3358 frames ended in fdb_rx_no_slot and the counters alone
+cannot say whether the descriptor index was 0xffff, pointed at a bound
+entry, or pointed at a non-bridge entry.
+
+The AN7581 PPE derives from the MediaTek PPE, whose bridge implementation
+does not let software fabricate an L2 entry. Hardware creates and owns
+the L2 flow entry, even for bridged frames, and reports the slot once the
+flow reaches the offload rate; software only fills the egress (action)
+fields of that entry. A software-built native L2B entry would have to
+provide the learned l2b.key itself, which the driver never writes and
+which 930 explicitly preserves from hardware. That is why this patch adds
+diagnostics instead of a self-build commit path.
+
+Capture the first 32 frames that the gate refuses, without allocation and
+without touching the PPE: descriptor index, raw CPU reason, raw ib1, the
+raw word at the native L2B ib2 offset, the parsed state/type and the gate
+outcome (range, no entry, bind, type). Add a 32-entry histogram of the raw
+CPU reason, incremented for every GDM RX descriptor, so a wrong reason
+encoding is visible too. Expose both through a new debugfs file,
+/sys/kernel/debug/ppe/l2b_dbg, next to the existing fdb_* counters.
+
+Also print the PPE configuration once after the NPU attach and add the
+same read-only registers to /sys/kernel/debug/ppe/config. In particular,
+airoha_ppe_hw_init() never writes REG_PPE_UNBIND_AGE (0x238), while the
+MediaTek PPE this block derives from programs MIN_PACKETS/DELTA there; the
+printed value is the one left by the bootloader/firmware. Nothing in this
+patch writes a PPE register, starts a commit, or changes the forwarding
+decision; the frames still go to the software bridge exactly as in 936.
+
+This is 937-net-airoha-add-l2b-slow-path-diagnostics.patch.
+
+Signed-off-by: Kitsune <km2077@foxmail.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1081,6 +1081,12 @@
+ 				     PKT_HASH_TYPE_L4);
+ 
+ 		reason = FIELD_GET(AIROHA_RXD4_PPE_CPU_REASON, msg1);
++		/* Diagnostic histogram: the five reasons below are the ones the
++		 * bridge slow path knows about, but an unexpected encoding must
++		 * be visible as well instead of silently going to software.
++		 */
++		if (eth->ppe && reason < ARRAY_SIZE(eth->ppe->rx_reason_count))
++			atomic64_inc(&eth->ppe->rx_reason_count[reason]);
+ 		switch (reason) {
+ 		case AIROHA_PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED:
+ 			/* The PPE already learned the L2B key of this flow and
+@@ -1102,7 +1108,7 @@
+ 			 */
+ 			if (!(dev->flags & AIROHA_PRIV_F_PON))
+ 				airoha_ppe_bridge_rx_slowpath(eth, q->skb,
+-							      hash);
++							      hash, reason);
+ 			break;
+ 		default:
+ 			/* Exception/error reasons stay with the software
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -8,6 +8,7 @@
+ #define AIROHA_ETH_H
+ 
+ #include <linux/airoha-eth.h>
++#include <linux/atomic.h>
+ #include <linux/debugfs.h>
+ #include <linux/etherdevice.h>
+ #include <linux/iopoll.h>
+@@ -775,6 +776,37 @@
+ 	AIROHA_PPE_CPU_REASON_HIT_PRE_BIND		= 0x1a,
+ };
+ 
++/* Maximum number of rejected bridge RX frames kept for /sys/kernel/debug/ppe/l2b_dbg.
++ * The RX path stops recording once the array is full; the running total stays
++ * available in fdb_stats.rx_no_flow/rx_no_slot.
++ */
++#define AIROHA_PPE_L2B_DBG_MAX		32
++
++/* Why the bridge RX slow path did not hand a descriptor slot to the promote
++ * path. Diagnostic only; nothing here changes forwarding.
++ */
++enum airoha_ppe_l2b_reject {
++	AIROHA_L2B_REJECT_RANGE = 1,	/* index outside the PPE table */
++	AIROHA_L2B_REJECT_NO_ENTRY,	/* index has no readable FOE entry */
++	AIROHA_L2B_REJECT_BIND,		/* slot is already bound */
++	AIROHA_L2B_REJECT_TYPE,		/* slot is not PPE_PKT_TYPE_BRIDGE */
++};
++
++/* One rejected frame, captured verbatim from the descriptor and the FOE slot.
++ * Filled on the RX softirq from a static array, so it must not sleep.
++ */
++struct airoha_ppe_l2b_dbg {
++	u32 hash;		/* AIROHA_RXD4_FOE_ENTRY as reported */
++	u32 reason;		/* AIROHA_RXD4_PPE_CPU_REASON as reported */
++	u32 ib1;		/* raw slot word 0, 0 when no slot */
++	u32 ib2;		/* raw native L2B word at entry offset 44 */
++	u32 state;		/* FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, ib1) */
++	u32 type;		/* FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, ib1) */
++	u32 reject;		/* enum airoha_ppe_l2b_reject */
++	u32 ifindex;		/* ingress netdev, 0 when skb->dev is NULL */
++	unsigned long jiffies;	/* when the frame was seen */
++};
++
+ /* Port parent id ("switch id") reported for every GMAC netdev of one
+  * controller, see airoha_get_port_parent_id(). The bridge only compares it
+  * byte for byte to decide whether two ports belong to the same hardware
+@@ -818,6 +850,28 @@
+ 		unsigned long rx_no_slot;   /* no unbound L2B slot, promote skipped */
+ 	} fdb_stats;
+ 
++	/* Diagnostic-only evidence for the bridge RX slow path. The ring is
++	 * filled with the first AIROHA_PPE_L2B_DBG_MAX rejected frames and is
++	 * read through /sys/kernel/debug/ppe/l2b_dbg. No hardware writes and no
++	 * allocation in the RX path.
++	 */
++	struct {
++		struct airoha_ppe_l2b_dbg entry[AIROHA_PPE_L2B_DBG_MAX];
++		u32 count;
++		spinlock_t lock;
++	} l2b_dbg;
++
++	/* Raw AIROHA_RXD4_PPE_CPU_REASON histogram, 5 bits wide. Incremented
++	 * for every GDM RX descriptor before the reason is dispatched, so a
++	 * wrong CPU-reason assumption shows up here as well.
++	 */
++	atomic64_t rx_reason_count[32];
++
++	/* AIROHA_PPE_L2B_DBG_LOGGED once airoha_ppe_offload_setup() has printed
++	 * the PPE configuration.
++	 */
++	unsigned long l2b_dbg_state;
++
+ 	/* Inspects the bridge FDB entries offloaded to the PPE, see
+ 	 * airoha_ppe_fdb_refresh_work(). Only started when the
+ 	 * fdb_refresh_period module parameter is not 0.
+@@ -962,7 +1016,7 @@
+ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 			  u16 hash, bool rx_wlan);
+ void airoha_ppe_bridge_rx_slowpath(struct airoha_eth *eth,
+-				   struct sk_buff *skb, u32 hash);
++				   struct sk_buff *skb, u32 hash, u32 reason);
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data);
+ int airoha_ppe_init(struct airoha_eth *eth);
+ void airoha_ppe_deinit(struct airoha_eth *eth);
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -28,6 +28,9 @@
+ #define AIROHA_PPE_NPU_ATTACH_SCHEDULED	0
+ #define AIROHA_PPE_NPU_ATTACH_DISABLED	1
+ 
++/* airoha_ppe::l2b_dbg_state bits. */
++#define AIROHA_PPE_L2B_DBG_LOGGED	0
++
+ static DEFINE_SPINLOCK(ppe_lock);
+ 
+ static const struct rhashtable_params airoha_flow_table_params = {
+@@ -1718,11 +1721,85 @@
+ 	mutex_unlock(&flow_offload_mutex);
+ }
+ 
++/* Record one refused bridge RX frame. Diagnostic only: the slot is not
++ * touched, the frame keeps going to the software bridge and the ring is left
++ * alone once it is full.
++ */
++static void airoha_ppe_l2b_dbg_record(struct airoha_ppe *ppe,
++				      const struct sk_buff *skb,
++				      u32 hash, u32 reason, u32 ib1, u32 ib2,
++				      u32 state, u32 type,
++				      enum airoha_ppe_l2b_reject reject)
++{
++	struct airoha_ppe_l2b_dbg *e;
++	unsigned long flags;
++
++	spin_lock_irqsave(&ppe->l2b_dbg.lock, flags);
++
++	if (ppe->l2b_dbg.count < ARRAY_SIZE(ppe->l2b_dbg.entry)) {
++		e = &ppe->l2b_dbg.entry[ppe->l2b_dbg.count++];
++		e->hash = hash;
++		e->reason = reason;
++		e->ib1 = ib1;
++		e->ib2 = ib2;
++		e->state = state;
++		e->type = type;
++		e->reject = reject;
++		e->ifindex = skb->dev ? skb->dev->ifindex : 0;
++		e->jiffies = jiffies;
++	}
++
++	spin_unlock_irqrestore(&ppe->l2b_dbg.lock, flags);
++}
++
++/* Print the PPE configuration once, right after the NPU attach programmed it.
++ * Read-only: this is the evidence needed to decide why the hardware does not
++ * leave the unbound L2B slot that the RX slow path expects.
++ *
++ * airoha_ppe_hw_init() programs PPE_TB_HASH_CFG, PPE_TB_CFG and
++ * PPE_BIND_RATE, but it never writes REG_PPE_UNBIND_AGE (0x238). The
++ * MediaTek PPE this block derives from sets MIN_PACKETS/DELTA there, so the
++ * read below tells whether the AN7581 bootloader or firmware left a value
++ * that ages the unbound entry out before the CPU sees it. This function does
++ * not write the register.
++ */
++static void airoha_ppe_l2b_dbg_log_config(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++	unsigned int i;
++
++	if (test_and_set_bit(AIROHA_PPE_L2B_DBG_LOGGED, &ppe->l2b_dbg_state))
++		return;
++
++	dev_info(eth->dev, "PPE diagnostic: npu_attached=%u num_ppe=%u\n",
++		 !!rcu_access_pointer(eth->npu), eth->soc->num_ppe);
++
++	for (i = 0; i < eth->soc->num_ppe; i++) {
++		u32 unbind_age = airoha_fe_rr(eth, REG_PPE_UNBIND_AGE(i));
++		u32 bind_rate = airoha_fe_rr(eth, REG_PPE_BIND_RATE(i));
++		u32 tb_cfg = airoha_fe_rr(eth, REG_PPE_TB_CFG(i));
++		u32 hash_cfg = airoha_fe_rr(eth, REG_PPE_TB_HASH_CFG(i));
++		u32 hash_seed = airoha_fe_rr(eth, REG_PPE_HASH_SEED(i));
++
++		dev_info(eth->dev,
++			 "PPE%u: unbind_age=%08x min_packets=%u delta=%u driver_writes_unbind_age=0 bind_rate=%08x l2b_bind=%u bind=%u tb_cfg=%08x search_miss=%u hash_cfg=%08x hash_seed=%08x\n",
++			 i, unbind_age,
++			 (u32)FIELD_GET(PPE_UNBIND_AGE_MIN_PACKETS_MASK, unbind_age),
++			 (u32)FIELD_GET(PPE_UNBIND_AGE_DELTA_MASK, unbind_age),
++			 bind_rate,
++			 (u32)FIELD_GET(PPE_BIND_RATE_L2B_BIND_MASK, bind_rate),
++			 (u32)FIELD_GET(PPE_BIND_RATE_BIND_MASK, bind_rate),
++			 tb_cfg, (u32)FIELD_GET(PPE_TB_CFG_SEARCH_MISS_MASK, tb_cfg),
++			 hash_cfg, hash_seed);
++	}
++}
++
+ /**
+  * airoha_ppe_bridge_rx_slowpath() - promote a bridged frame the PPE punted
+  * @eth: airoha ethernet device
+  * @skb: frame handed to the CPU by the PPE
+  * @hash: PPE entry index from AIROHA_RXD4_FOE_ENTRY
++ * @reason: AIROHA_RXD4_PPE_CPU_REASON of this frame
+  *
+  * Called from the RX softirq for the CPU reasons that mean "this frame has
+  * no bound flow". The descriptor entry index is only usable when the PPE left
+@@ -1733,6 +1810,11 @@
+  * frame inside NAPI, so a slot that does not hold an unbound BRIDGE entry is
+  * counted and left to the software bridge instead of inventing a hash.
+  *
++ * The diagnostic ring records the first rejected frames so a board test can
++ * see whether the descriptor index is 0xffff ("hardware built nothing"), a
++ * valid unbound BRIDGE entry (the gate accepted it), or some other slot. It
++ * performs no hardware writes and does not change forwarding.
++ *
+  * The first frame can also race the asynchronous NPU attach. The attach runs
+  * airoha_ppe_hw_init(), which is what enables the PPE tables, the L2B bind
+  * rate and the hash seed in the first place; a pure bridge otherwise never
+@@ -1741,11 +1823,12 @@
+  * and let the next frame retry.
+  */
+ void airoha_ppe_bridge_rx_slowpath(struct airoha_eth *eth,
+-				   struct sk_buff *skb, u32 hash)
++				   struct sk_buff *skb, u32 hash, u32 reason)
+ {
++	struct airoha_foe_entry *hwe = NULL;
+ 	struct airoha_ppe *ppe = eth->ppe;
+-	u32 ppe_hash_mask;
+-	bool bridge_slowpath;
++	u32 ppe_hash_mask, ib1 = 0, ib2 = 0;
++	u32 state = AIROHA_FOE_STATE_INVALID, type = 0;
+ 
+ 	if (!ppe)
+ 		return;
+@@ -1776,15 +1859,44 @@
+ 	ppe_hash_mask = airoha_ppe_get_total_num_entries(ppe) - 1;
+ 	if (hash > ppe_hash_mask) {
+ 		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.rx_no_slot);
++		airoha_ppe_l2b_dbg_record(ppe, skb, hash, reason, 0, 0,
++					  AIROHA_FOE_STATE_INVALID, 0,
++					  AIROHA_L2B_REJECT_RANGE);
+ 		return;
+ 	}
+ 
+ 	spin_lock_bh(&ppe_lock);
+-	bridge_slowpath = airoha_ppe_foe_is_bridge_slowpath(ppe, hash);
++	hwe = airoha_ppe_foe_get_entry_locked(ppe, hash);
++	if (hwe) {
++		ib1 = READ_ONCE(hwe->ib1);
++		/* Raw word at the native L2B ib2 offset (entry offset 44),
++		 * useful even when the slot turned out to be another type.
++		 */
++		ib2 = READ_ONCE(hwe->l2b.ib2);
++		state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, ib1);
++		type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, ib1);
++	}
+ 	spin_unlock_bh(&ppe_lock);
+ 
+-	if (!bridge_slowpath) {
++	if (!hwe) {
++		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.rx_no_slot);
++		airoha_ppe_l2b_dbg_record(ppe, skb, hash, reason, 0, 0,
++					  AIROHA_FOE_STATE_INVALID, 0,
++					  AIROHA_L2B_REJECT_NO_ENTRY);
++		return;
++	}
++
++	if (state == AIROHA_FOE_STATE_BIND) {
+ 		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.rx_no_slot);
++		airoha_ppe_l2b_dbg_record(ppe, skb, hash, reason, ib1, ib2,
++					  state, type, AIROHA_L2B_REJECT_BIND);
++		return;
++	}
++
++	if (type != PPE_PKT_TYPE_BRIDGE) {
++		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.rx_no_slot);
++		airoha_ppe_l2b_dbg_record(ppe, skb, hash, reason, ib1, ib2,
++					  state, type, AIROHA_L2B_REJECT_TYPE);
+ 		return;
+ 	}
+ 
+@@ -2529,6 +2641,11 @@
+ 	rcu_assign_pointer(eth->npu, npu);
+ 	synchronize_rcu();
+ 
++	/* One-shot read-only snapshot of the registers that decide whether
++	 * the hardware leaves an unbound L2B entry for the slow path.
++	 */
++	airoha_ppe_l2b_dbg_log_config(ppe);
++
+ 	return 0;
+ 
+ error_npu_put:
+@@ -2754,6 +2871,9 @@
+ 	if (err)
+ 		goto error_l2_flow_table_destroy;
+ 
++	spin_lock_init(&ppe->l2b_dbg.lock);
++	ppe->l2b_dbg.count = 0;
++
+ 	INIT_WORK(&ppe->npu_attach_work, airoha_ppe_npu_attach_work);
+ 
+ 	err = airoha_ppe_debugfs_init(ppe);
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -4,6 +4,8 @@
+  * Author: Lorenzo Bianconi <lorenzo@kernel.org>
+  */
+ 
++#include <linux/slab.h>
++
+ #include "airoha_regs.h"
+ #include "airoha_eth.h"
+ 
+@@ -223,6 +225,24 @@
+ 			   airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(i)));
+ 		seq_printf(m, "ppe%u_table_cfg: %08x\n", i,
+ 			   airoha_fe_rr(eth, REG_PPE_TB_CFG(i)));
++		seq_printf(m, "ppe%u_bind_rate: %08x l2b_bind=%u bind=%u\n", i,
++			   airoha_fe_rr(eth, REG_PPE_BIND_RATE(i)),
++			   (u32)FIELD_GET(PPE_BIND_RATE_L2B_BIND_MASK,
++					  airoha_fe_rr(eth, REG_PPE_BIND_RATE(i))),
++			   (u32)FIELD_GET(PPE_BIND_RATE_BIND_MASK,
++					  airoha_fe_rr(eth, REG_PPE_BIND_RATE(i))));
++		/* airoha_ppe_hw_init() never writes 0x238; this is the value
++		 * the bootloader/firmware left behind, read-only.
++		 */
++		seq_printf(m, "ppe%u_unbind_age: %08x min_packets=%u delta=%u driver_writes=0\n",
++			   i, airoha_fe_rr(eth, REG_PPE_UNBIND_AGE(i)),
++			   (u32)FIELD_GET(PPE_UNBIND_AGE_MIN_PACKETS_MASK,
++					  airoha_fe_rr(eth, REG_PPE_UNBIND_AGE(i))),
++			   (u32)FIELD_GET(PPE_UNBIND_AGE_DELTA_MASK,
++					  airoha_fe_rr(eth, REG_PPE_UNBIND_AGE(i))));
++		seq_printf(m, "ppe%u_hash_cfg: %08x hash_seed=%08x\n", i,
++			   airoha_fe_rr(eth, REG_PPE_TB_HASH_CFG(i)),
++			   airoha_fe_rr(eth, REG_PPE_HASH_SEED(i)));
+ 		seq_printf(m, "ppe%u_gdm2_default_cpu_port: %u\n", i,
+ 			   FIELD_GET(DFT_CPORT_MASK(AIROHA_GDM2_IDX), cport));
+ 	}
+@@ -231,6 +251,83 @@
+ }
+ DEFINE_SHOW_ATTRIBUTE(airoha_ppe_debugfs_config);
+ 
++static const char *airoha_ppe_l2b_reject_str(u32 reject)
++{
++	switch (reject) {
++	case AIROHA_L2B_REJECT_RANGE:
++		return "RANGE";
++	case AIROHA_L2B_REJECT_NO_ENTRY:
++		return "NO_ENTRY";
++	case AIROHA_L2B_REJECT_BIND:
++		return "BIND";
++	case AIROHA_L2B_REJECT_TYPE:
++		return "TYPE";
++	default:
++		return "UNKNOWN";
++	}
++}
++
++/* Diagnostic snapshot of the bridge RX slow path. Reads the fixed ring filled
++ * by airoha_ppe_l2b_dbg_record() and the per-reason histogram. Nothing here
++ * touches the PPE, so the file is safe to read while traffic is running.
++ */
++static int airoha_ppe_debugfs_l2b_dbg_show(struct seq_file *m, void *private)
++{
++	struct airoha_ppe *ppe = m->private;
++	struct airoha_eth *eth = ppe->eth;
++	struct airoha_ppe_l2b_dbg *ring;
++	unsigned long flags;
++	unsigned int count, i;
++
++	ring = kcalloc(AIROHA_PPE_L2B_DBG_MAX, sizeof(*ring), GFP_KERNEL);
++	if (!ring)
++		return -ENOMEM;
++
++	spin_lock_irqsave(&ppe->l2b_dbg.lock, flags);
++	count = ppe->l2b_dbg.count;
++	memcpy(ring, ppe->l2b_dbg.entry, count * sizeof(*ring));
++	spin_unlock_irqrestore(&ppe->l2b_dbg.lock, flags);
++
++	seq_printf(m, "recorded: %u / %u\n", count, AIROHA_PPE_L2B_DBG_MAX);
++	seq_printf(m, "fdb_rx_no_flow: %lu fdb_rx_no_slot: %lu fdb_promoted: %lu\n",
++		   ppe->fdb_stats.rx_no_flow, ppe->fdb_stats.rx_no_slot,
++		   ppe->fdb_stats.promoted);
++
++	for (i = 0; i < ARRAY_SIZE(ppe->rx_reason_count); i++)
++		seq_printf(m, "reason[0x%02x]: %llu\n", i,
++			   (unsigned long long)atomic64_read(&ppe->rx_reason_count[i]));
++
++	seq_puts(m, "idx ifindex hash reason ib1 ib2@44 state type bridge reject jiffies\n");
++	for (i = 0; i < count; i++) {
++		const struct airoha_ppe_l2b_dbg *e = &ring[i];
++
++		seq_printf(m, "%02u %u %04x %02x %08x %08x %u %u %u %s %lu\n",
++			   i, e->ifindex, e->hash, e->reason, e->ib1, e->ib2,
++			   e->state, e->type,
++			   e->type == PPE_PKT_TYPE_BRIDGE,
++			   airoha_ppe_l2b_reject_str(e->reject), e->jiffies);
++	}
++
++	for (i = 0; i < eth->soc->num_ppe; i++) {
++		u32 unbind_age = airoha_fe_rr(eth, REG_PPE_UNBIND_AGE(i));
++		u32 bind_rate = airoha_fe_rr(eth, REG_PPE_BIND_RATE(i));
++
++		seq_printf(m, "ppe%u_unbind_age: %08x min_packets=%u delta=%u driver_writes=0\n",
++			   i, unbind_age,
++			   (u32)FIELD_GET(PPE_UNBIND_AGE_MIN_PACKETS_MASK, unbind_age),
++			   (u32)FIELD_GET(PPE_UNBIND_AGE_DELTA_MASK, unbind_age));
++		seq_printf(m, "ppe%u_bind_rate: %08x l2b_bind=%u bind=%u\n",
++			   i, bind_rate,
++			   (u32)FIELD_GET(PPE_BIND_RATE_L2B_BIND_MASK, bind_rate),
++			   (u32)FIELD_GET(PPE_BIND_RATE_BIND_MASK, bind_rate));
++	}
++
++	kfree(ring);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(airoha_ppe_debugfs_l2b_dbg);
++
+ int airoha_ppe_debugfs_init(struct airoha_ppe *ppe)
+ {
+ 	ppe->debugfs_dir = debugfs_create_dir("ppe", NULL);
+@@ -240,6 +337,8 @@
+ 			    &airoha_ppe_debugfs_foe_all_fops);
+ 	debugfs_create_file("bind", 0444, ppe->debugfs_dir, ppe,
+ 			    &airoha_ppe_debugfs_foe_bind_fops);
++	debugfs_create_file("l2b_dbg", 0444, ppe->debugfs_dir, ppe,
++			    &airoha_ppe_debugfs_l2b_dbg_fops);
+ 
+ 	return 0;
+ }
