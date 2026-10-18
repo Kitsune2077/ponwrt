@@ -23,7 +23,7 @@ replication are not implemented yet.
 Signed-off-by: Kitsune <km2077@foxmail.com>
 ---
 diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
-index c3e5a98f7..6a128e540 100644
+index c3e5a98f7..5e654f477 100644
 --- a/drivers/net/ethernet/airoha/airoha_eth.h
 +++ b/drivers/net/ethernet/airoha/airoha_eth.h
 @@ -560,6 +560,14 @@ struct airoha_flow_table_entry {
@@ -72,13 +72,20 @@ index c3e5a98f7..6a128e540 100644
  struct airoha_wdma_info {
  	u8 idx;
  	u8 queue;
-@@ -717,6 +749,18 @@ struct airoha_ppe {
+@@ -717,6 +749,25 @@ struct airoha_ppe {
  
  	struct rhashtable l2_flows;
  
 +	/* Bridge FDB offload table, keyed on destination MAC + VLAN. */
 +	struct rhashtable fdb_table;
 +	struct list_head fdb_list;
++
++	/* On-demand NPU attach for the bridge FDB path. The attach routine
++	 * sleeps and may load the airoha-npu module, so it cannot run in the RX
++	 * slow path; see airoha_ppe_bridge_fdb_schedule_npu_attach().
++	 */
++	struct work_struct npu_attach_work;
++	unsigned long npu_attach_state;
 +
 +	/* Bridge FDB offload counters. */
 +	struct {
@@ -91,7 +98,7 @@ index c3e5a98f7..6a128e540 100644
  	struct hlist_head *foe_flow;
  	u16 *foe_check_time;
  
-@@ -840,6 +884,8 @@ airoha_qdma_deref(struct airoha_gdm_dev *dev)
+@@ -840,6 +891,8 @@ airoha_qdma_deref(struct airoha_gdm_dev *dev)
  void airoha_ppe_set_mtu(struct airoha_gdm_dev *dev);
  void airoha_ppe_set_cpu_port(struct airoha_gdm_dev *dev, u8 ppe_id, u8 fport);
  void airoha_ppe_remove_egress_flows(struct airoha_gdm_dev *dev);
@@ -101,7 +108,7 @@ index c3e5a98f7..6a128e540 100644
  void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
  			  u16 hash, bool rx_wlan);
 diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
-index 20842789c..78facd8d0 100644
+index 20842789c..a215a64f6 100644
 --- a/drivers/net/ethernet/airoha/airoha_ppe.c
 +++ b/drivers/net/ethernet/airoha/airoha_ppe.c
 @@ -9,6 +9,7 @@
@@ -112,7 +119,19 @@ index 20842789c..78facd8d0 100644
  #include <linux/rhashtable.h>
  #include <net/ipv6.h>
  #include <linux/if_vlan.h>
-@@ -38,6 +39,13 @@ static const struct rhashtable_params airoha_l2_flow_table_params = {
+@@ -22,6 +23,11 @@
+  * configuration.
+  */
+ DEFINE_MUTEX(flow_offload_mutex);
++
++/* airoha_ppe::npu_attach_state bits. */
++#define AIROHA_PPE_NPU_ATTACH_SCHEDULED	0
++#define AIROHA_PPE_NPU_ATTACH_DISABLED	1
++
+ static DEFINE_SPINLOCK(ppe_lock);
+ 
+ static const struct rhashtable_params airoha_flow_table_params = {
+@@ -38,6 +44,13 @@ static const struct rhashtable_params airoha_l2_flow_table_params = {
  	.automatic_shrinking = true,
  };
  
@@ -126,7 +145,7 @@ index 20842789c..78facd8d0 100644
  static int airoha_ppe_get_num_stats_entries(struct airoha_ppe *ppe)
  {
  	if (!IS_ENABLED(CONFIG_NET_AIROHA_FLOW_STATS))
-@@ -1008,7 +1016,7 @@ airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *ppe,
+@@ -1008,7 +1021,7 @@ airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *ppe,
  	u32 mask = AIROHA_FOE_IB1_BIND_PACKET_TYPE | AIROHA_FOE_IB1_BIND_UDP;
  	struct airoha_foe_entry *hwe_p, hwe;
  	struct airoha_flow_table_entry *f;
@@ -135,7 +154,7 @@ index 20842789c..78facd8d0 100644
  
  	hwe_p = airoha_ppe_foe_get_entry_locked(ppe, hash);
  	if (!hwe_p)
-@@ -1054,19 +1062,37 @@ airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *ppe,
+@@ -1054,19 +1067,37 @@ airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *ppe,
  
  	hwe.bridge.data = e->data.bridge.data;
  commit:
@@ -179,7 +198,7 @@ index 20842789c..78facd8d0 100644
  	struct hlist_node *n;
  	u32 index, state;
  
-@@ -1083,8 +1109,10 @@ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+@@ -1083,8 +1114,10 @@ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
  	/* Native L2B uses its learned key, not an IPv4/L4 software hash bucket. */
  	if (airoha_is_7581(ppe->eth) &&
  	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1) ==
@@ -191,7 +210,7 @@ index 20842789c..78facd8d0 100644
  
  	index = airoha_ppe_foe_get_entry_hash(ppe, hwe);
  	hlist_for_each_entry_safe(e, n, &ppe->foe_flow[index], list) {
-@@ -1112,10 +1140,20 @@ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+@@ -1112,10 +1145,20 @@ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
  	airoha_ppe_foe_set_bridge_addrs(&br, eth_hdr(skb));
  	e = rhashtable_lookup_fast(&ppe->l2_flows, &br,
  				   airoha_l2_flow_table_params);
@@ -213,7 +232,7 @@ index 20842789c..78facd8d0 100644
  }
  
  static int
-@@ -1133,9 +1171,15 @@ airoha_ppe_foe_l2_flow_commit_entry(struct airoha_ppe *ppe,
+@@ -1133,9 +1176,15 @@ airoha_ppe_foe_l2_flow_commit_entry(struct airoha_ppe *ppe,
  	if (IS_ERR(prev))
  		return PTR_ERR(prev);
  
@@ -232,7 +251,7 @@ index 20842789c..78facd8d0 100644
  }
  
  static int airoha_ppe_foe_flow_commit_entry(struct airoha_ppe *ppe,
-@@ -1158,6 +1202,373 @@ static int airoha_ppe_foe_flow_commit_entry(struct airoha_ppe *ppe,
+@@ -1158,6 +1207,404 @@ static int airoha_ppe_foe_flow_commit_entry(struct airoha_ppe *ppe,
  	return 0;
  }
  
@@ -322,6 +341,37 @@ index 20842789c..78facd8d0 100644
 +	/* Only L2B entries are bridging candidates. */
 +	return FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1) ==
 +	       PPE_PKT_TYPE_BRIDGE;
++}
++
++/* Attach the NPU on demand for the bridge path.
++ *
++ * eth->npu is assigned by airoha_ppe_offload_setup(), which is only called
++ * from the nft flowtable path (TC_SETUP_FT). A box that only bridges never
++ * goes through that path, so its PPE entries would never be committed.
++ *
++ * airoha_ppe_offload_setup() cannot run in the RX softirq: it may call
++ * request_module(), sleeps in the NPU firmware handshake and polls the PPE
++ * registers. Hand the attach to a work item instead. schedule_work()
++ * coalesces the requests from every frame, and a failed attempt leaves the
++ * frames to the software bridge and is retried by the next one.
++ */
++static void airoha_ppe_bridge_fdb_schedule_npu_attach(struct airoha_ppe *ppe)
++{
++	/* Already attached, or the device is going away. */
++	if (rcu_access_pointer(ppe->eth->npu) ||
++	    test_bit(AIROHA_PPE_NPU_ATTACH_DISABLED, &ppe->npu_attach_state))
++		return;
++
++	/* One work item at a time. If it is already queued or running there is
++	 * nothing to do; the worker clears the bit when it is finished.
++	 */
++	if (test_and_set_bit(AIROHA_PPE_NPU_ATTACH_SCHEDULED,
++			     &ppe->npu_attach_state))
++		return;
++
++	if (!schedule_work(&ppe->npu_attach_work))
++		clear_bit(AIROHA_PPE_NPU_ATTACH_SCHEDULED,
++			  &ppe->npu_attach_state);
 +}
 +
 +/* Promote the frame received on the RX slow path into a per-flow FOE entry.
@@ -606,19 +656,59 @@ index 20842789c..78facd8d0 100644
  static int airoha_ppe_get_entry_idle_time(struct airoha_ppe *ppe, u32 ib1)
  {
  	u32 state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, ib1);
-@@ -1705,7 +2116,10 @@ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+@@ -1664,6 +2111,33 @@ static int airoha_ppe_offload_setup(struct airoha_eth *eth)
+ 	return err;
+ }
+ 
++static void airoha_ppe_npu_attach_work(struct work_struct *work)
++{
++	struct airoha_ppe *ppe = container_of(work, struct airoha_ppe,
++					      npu_attach_work);
++	struct airoha_eth *eth = ppe->eth;
++	int err = 0;
++
++	/* Serialise with the nft flowtable path, which attaches the NPU under
++	 * the same mutex, and re-check eth->npu so that only one of the two
++	 * takes the reference. This runs in process context and may sleep.
++	 */
++	mutex_lock(&flow_offload_mutex);
++
++	if (!test_bit(AIROHA_PPE_NPU_ATTACH_DISABLED, &ppe->npu_attach_state) &&
++	    !rcu_access_pointer(eth->npu))
++		err = airoha_ppe_offload_setup(eth);
++
++	mutex_unlock(&flow_offload_mutex);
++
++	clear_bit(AIROHA_PPE_NPU_ATTACH_SCHEDULED, &ppe->npu_attach_state);
++
++	if (err)
++		dev_warn_ratelimited(eth->dev,
++				     "failed to attach the NPU for bridge offload: %d\n",
++				     err);
++}
++
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data)
+ {
+ 	struct airoha_ppe *ppe = dev->priv;
+@@ -1705,7 +2179,16 @@ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
  		return;
  
  	ppe->foe_check_time[hash] = now;
 -	airoha_ppe_foe_insert_entry(ppe, skb, hash, rx_wlan);
 +	if (!rx_wlan &&
 +	    airoha_ppe_foe_insert_entry(ppe, skb, hash, rx_wlan) ==
-+	    AIROHA_FOE_SLOWPATH_BRIDGE)
++	    AIROHA_FOE_SLOWPATH_BRIDGE) {
++		/* The nft flowtable path attaches the NPU only when it offloads
++		 * an IP flow, which a pure bridge never does. Make sure the
++		 * attach has been requested before the promotion below.
++		 */
++		airoha_ppe_bridge_fdb_schedule_npu_attach(ppe);
 +		airoha_ppe_bridge_fdb_promote(ppe, skb, hash);
++	}
  }
  
  void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr)
-@@ -1840,12 +2254,19 @@ int airoha_ppe_init(struct airoha_eth *eth)
+@@ -1840,12 +2323,21 @@ int airoha_ppe_init(struct airoha_eth *eth)
  	if (err)
  		goto error_flow_table_destroy;
  
@@ -628,6 +718,8 @@ index 20842789c..78facd8d0 100644
  	if (err)
  		goto error_l2_flow_table_destroy;
  
++	INIT_WORK(&ppe->npu_attach_work, airoha_ppe_npu_attach_work);
++
 +	err = airoha_ppe_debugfs_init(ppe);
 +	if (err)
 +		goto error_fdb_table_destroy;
@@ -639,10 +731,20 @@ index 20842789c..78facd8d0 100644
  error_l2_flow_table_destroy:
  	rhashtable_destroy(&ppe->l2_flows);
  error_flow_table_destroy:
-@@ -1870,6 +2291,9 @@ void airoha_ppe_deinit(struct airoha_eth *eth)
+@@ -1868,8 +2360,19 @@ void airoha_ppe_deinit(struct airoha_eth *eth)
+ 		airoha_npu_put(npu);
+ 	}
  
++	set_bit(AIROHA_PPE_NPU_ATTACH_DISABLED, &eth->ppe->npu_attach_state);
++
  	mutex_unlock(&flow_offload_mutex);
  
++	/* A queued attach must not run after the PPE tables are gone. The
++	 * worker re-checks the DISABLED bit under flow_offload_mutex, so the
++	 * work queued before this point cannot re-attach the NPU.
++	 */
++	cancel_work_sync(&eth->ppe->npu_attach_work);
++
 +	airoha_ppe_bridge_fdb_flush(eth->ppe);
 +
 +	rhashtable_destroy(&eth->ppe->fdb_table);
