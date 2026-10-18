@@ -1,0 +1,247 @@
+From: Kitsune <km2077@foxmail.com>
+Subject: [PATCH] net: airoha: bridge: trigger FDB promotion from the RX slow path
+
+The PPE only calls airoha_ppe_check_skb() for
+AIROHA_RXD4_PPE_CPU_REASON == 0x0f (HIT_UNBIND_RATE_REACHED), i.e. when
+the flow already has an FOE slot that the hardware wants to bind. A pure
+bridge never creates that slot through the nft flowtable path: the bridge
+FDB promote is therefore unreachable for the first frame of every
+(source MAC, destination MAC) pair, and npu_attached stays 0 because only
+the promote path requests the NPU.
+
+Worse, airoha_ppe_hw_init() - the code that enables the PPE tables, the
+L2B bind rate and the hash seed - runs only from the NPU attach performed
+by airoha_ppe_offload_setup(). A box that only bridges never goes through
+that path either, so the PPE is not even programmed to create the unbound
+L2B slot.
+
+Dispatch the "no flow" CPU reasons to a new
+airoha_ppe_bridge_rx_slowpath(). 0x0f is already matched by the driver;
+0x07 NO_FLOW, 0x0d UN_HIT, 0x0e HIT_UNBIND and 0x1a HIT_PRE_BIND follow the
+shared MediaTek-lineage encoding and are not yet measured on an AN7581.
+The new path only promotes when the descriptor FOE entry index really points
+at an unbound BRIDGE entry: the native L2B commit keeps the
+hardware-learned key (including the opaque l2b.key), and there is no safe
+way to synthesize that key in NAPI, so an empty or foreign slot is counted
+in fdb_stats.rx_no_slot and left to the software bridge rather than
+inventing a hash. The existing 0x0f path is unchanged and a frame is
+dispatched to exactly one of the two paths.
+
+The bridge FDB add path now requests the NPU attach before traffic, so
+airoha_ppe_hw_init() runs before the first frame and the hardware can
+create the unbound L2B slot the promote needs. The RX path requests the
+same work item as a fallback. Both use the existing
+airoha_ppe_bridge_fdb_schedule_npu_attach() worker; nothing attaches in
+softirq. fdb_stats.rx_no_flow and rx_no_slot are exported through
+/sys/kernel/debug/ppe/config next to npu_attached, so the trigger is
+observable on a board.
+
+Signed-off-by: Kitsune <km2077@foxmail.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1081,9 +1081,35 @@
+ 				     PKT_HASH_TYPE_L4);
+ 
+ 		reason = FIELD_GET(AIROHA_RXD4_PPE_CPU_REASON, msg1);
+-		if (reason == PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED)
++		switch (reason) {
++		case AIROHA_PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED:
++			/* The PPE already learned the L2B key of this flow and
++			 * wants the CPU to bind it: this is the original path.
++			 */
+ 			airoha_ppe_check_skb(&eth->ppe->dev, q->skb, hash,
+ 					     false);
++			break;
++		case AIROHA_PPE_CPU_REASON_NO_FLOW:
++		case AIROHA_PPE_CPU_REASON_UN_HIT:
++		case AIROHA_PPE_CPU_REASON_HIT_UNBIND:
++		case AIROHA_PPE_CPU_REASON_HIT_PRE_BIND:
++			/* The PPE has no bound flow and handed the frame to the
++			 * CPU. A pure bridge never goes through the nft
++			 * flowtable path, so nothing else can promote the first
++			 * frame of a (source MAC, destination MAC) pair. Do not
++			 * do this for PON ingress; upstream/downstream tag
++			 * handling is out of scope for this trigger.
++			 */
++			if (!(dev->flags & AIROHA_PRIV_F_PON))
++				airoha_ppe_bridge_rx_slowpath(eth, q->skb,
++							      hash);
++			break;
++		default:
++			/* Exception/error reasons stay with the software
++			 * bridge, they are not bridge FDB candidates.
++			 */
++			break;
++		}
+ 
+ 		done++;
+ 		if (dev->flags & AIROHA_PRIV_F_PON) {
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -757,6 +757,24 @@
+ #define AIROHA_RXD4_PPE_CPU_REASON	GENMASK(20, 16)
+ #define AIROHA_RXD4_FOE_ENTRY		GENMASK(15, 0)
+ 
++/* PPE CPU reasons used by the bridge slow path.
++ *
++ * The AN7581 PPE reports the reason a frame was handed to the CPU in
++ * AIROHA_RXD4_PPE_CPU_REASON. The encoding is the same one the MediaTek PPE
++ * this block derives from uses (PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED, which
++ * the driver already matched, is 0x0f in both). Only the reasons that mean
++ * "the flow is not bound / has no entry, forward it in software" are listed:
++ * the exception reasons (TTL exceeded, fragments, option headers, VLAN
++ * violation, ...) must never reach the bridge promote path.
++ */
++enum airoha_ppe_cpu_reason {
++	AIROHA_PPE_CPU_REASON_NO_FLOW			= 0x07,
++	AIROHA_PPE_CPU_REASON_UN_HIT			= 0x0d,
++	AIROHA_PPE_CPU_REASON_HIT_UNBIND		= 0x0e,
++	AIROHA_PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED	= 0x0f,
++	AIROHA_PPE_CPU_REASON_HIT_PRE_BIND		= 0x1a,
++};
++
+ /* Port parent id ("switch id") reported for every GMAC netdev of one
+  * controller, see airoha_get_port_parent_id(). The bridge only compares it
+  * byte for byte to decide whether two ports belong to the same hardware
+@@ -796,6 +814,8 @@
+ 		unsigned long vlan_pop;     /* pop needed, still software */
+ 		unsigned long vlan_skip;    /* unsupported rewrite, software */
+ 		unsigned long no_npu;       /* NPU not configured, promote skipped */
++		unsigned long rx_no_flow;   /* no-flow CPU reason, bridge path */
++		unsigned long rx_no_slot;   /* no unbound L2B slot, promote skipped */
+ 	} fdb_stats;
+ 
+ 	/* Inspects the bridge FDB entries offloaded to the PPE, see
+@@ -941,6 +961,8 @@
+ bool airoha_ppe_is_enabled(struct airoha_eth *eth, int index);
+ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 			  u16 hash, bool rx_wlan);
++void airoha_ppe_bridge_rx_slowpath(struct airoha_eth *eth,
++				   struct sk_buff *skb, u32 hash);
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data);
+ int airoha_ppe_init(struct airoha_eth *eth);
+ void airoha_ppe_deinit(struct airoha_eth *eth);
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1719,6 +1719,79 @@
+ }
+ 
+ /**
++ * airoha_ppe_bridge_rx_slowpath() - promote a bridged frame the PPE punted
++ * @eth: airoha ethernet device
++ * @skb: frame handed to the CPU by the PPE
++ * @hash: PPE entry index from AIROHA_RXD4_FOE_ENTRY
++ *
++ * Called from the RX softirq for the CPU reasons that mean "this frame has
++ * no bound flow". The descriptor entry index is only usable when the PPE left
++ * the unbound native L2B entry of this very frame in that slot:
++ * airoha_ppe_foe_commit_subflow_entry() preserves the hardware-learned
++ * ingress key (including the opaque native l2b.key) and only copies the
++ * egress action into it. There is no safe way to synthesize that key from a
++ * frame inside NAPI, so a slot that does not hold an unbound BRIDGE entry is
++ * counted and left to the software bridge instead of inventing a hash.
++ *
++ * The first frame can also race the asynchronous NPU attach. The attach runs
++ * airoha_ppe_hw_init(), which is what enables the PPE tables, the L2B bind
++ * rate and the hash seed in the first place; a pure bridge otherwise never
++ * reaches the nft flowtable path that used to perform it. Request the attach
++ * here as a fallback (the FDB add path requests it earlier, before traffic)
++ * and let the next frame retry.
++ */
++void airoha_ppe_bridge_rx_slowpath(struct airoha_eth *eth,
++				   struct sk_buff *skb, u32 hash)
++{
++	struct airoha_ppe *ppe = eth->ppe;
++	u32 ppe_hash_mask;
++	bool bridge_slowpath;
++
++	if (!ppe)
++		return;
++
++	/* A GDM port that is a bridge port is straightforward. A frame from a
++	 * DSA user port also needs the bridge promote path, but it reaches the
++	 * driver on the conduit netdev, which is not itself the bridge port;
++	 * the FDB lookup below resolves the real egress port by destination
++	 * MAC. Without the DSA case the lan3(DSA) -> lan1(GDM) test would
++	 * silently skip every frame.
++	 */
++	if (!netif_is_bridge_port(skb->dev) && !netdev_uses_dsa(skb->dev))
++		return;
++
++	/* Flooded destinations are replicated by the software bridge; keep
++	 * the same eligibility test as airoha_ppe_bridge_fdb_promote().
++	 */
++	if (is_multicast_ether_addr(eth_hdr(skb)->h_dest))
++		return;
++
++	airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.rx_no_flow);
++
++	if (!rcu_access_pointer(eth->npu)) {
++		airoha_ppe_bridge_fdb_schedule_npu_attach(ppe);
++		return;
++	}
++
++	ppe_hash_mask = airoha_ppe_get_total_num_entries(ppe) - 1;
++	if (hash > ppe_hash_mask) {
++		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.rx_no_slot);
++		return;
++	}
++
++	spin_lock_bh(&ppe_lock);
++	bridge_slowpath = airoha_ppe_foe_is_bridge_slowpath(ppe, hash);
++	spin_unlock_bh(&ppe_lock);
++
++	if (!bridge_slowpath) {
++		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.rx_no_slot);
++		return;
++	}
++
++	airoha_ppe_bridge_fdb_promote(ppe, skb, hash);
++}
++
++/**
+  * airoha_ppe_bridge_fdb_update() - track a bridge FDB entry for PPE offload
+  * @eth: airoha ethernet device
+  * @addr: MAC address the bridge learned, destination of the offloaded flows
+@@ -1803,10 +1876,20 @@
+ 
+ 	spin_unlock_bh(&ppe_lock);
+ 
+-	if (err)
++	if (err) {
+ 		kfree(fdb);
++		return err;
++	}
++
++	/* Program the PPE before the first frame, not after it: the NPU
++	 * attach runs airoha_ppe_hw_init(), which enables the PPE tables and
++	 * the L2B bind rate. Without this a pure bridge would only request it
++	 * from the RX slow path, i.e. after the first frames were already
++	 * forwarded by the software bridge.
++	 */
++	airoha_ppe_bridge_fdb_schedule_npu_attach(ppe);
+ 
+-	return err;
++	return 0;
+ }
+ 
+ static int airoha_ppe_get_entry_idle_time(struct airoha_ppe *ppe, u32 ib1)
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -197,6 +197,15 @@
+ 	 */
+ 	seq_printf(m, "npu_attached: %u\n",
+ 		   !!rcu_access_pointer(eth->npu));
++	/* Bridge FDB offload counters. rx_no_flow counts frames that reached
++	 * the new no-flow RX trigger; rx_no_slot counts those that found no
++	 * unbound L2B entry at the descriptor index and stayed in software.
++	 */
++	seq_printf(m, "fdb_promoted: %lu\n", ppe->fdb_stats.promoted);
++	seq_printf(m, "fdb_no_entry: %lu\n", ppe->fdb_stats.no_entry);
++	seq_printf(m, "fdb_no_npu: %lu\n", ppe->fdb_stats.no_npu);
++	seq_printf(m, "fdb_rx_no_flow: %lu\n", ppe->fdb_stats.rx_no_flow);
++	seq_printf(m, "fdb_rx_no_slot: %lu\n", ppe->fdb_stats.rx_no_slot);
+ 	seq_printf(m, "gdm2_fwd_cfg: %08x\n",
+ 		   airoha_fe_rr(eth, REG_GDM_FWD_CFG(AIROHA_GDM2_IDX)));
+ 	seq_printf(m, "fe_wan_port: %08x\n",

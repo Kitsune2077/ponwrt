@@ -9,6 +9,7 @@ added as follow-up patches:
 | `931-net-airoha-ppe-add-bridge-FDB-offload-table.patch` | D1, D3, D4, D5 |
 | `933-net-airoha-report-a-port-parent-id-for-bridge-offload.patch` | defensive probe fix |
 | `934-net-airoha-inspect-bridge-FDB-entries-held-by-PPE.patch` | D2 |
+| `936-net-airoha-bridge-trigger-fdb-promotion-from-rx.patch` | stage-3 RX trigger (see below) |
 
 `932-net-airoha-offload-bridge-ports-via-switchdev.patch` is unchanged.
 
@@ -301,8 +302,8 @@ retire them.
 - **VLAN flag changes** and bridge ageing: existing promoted flows are not
   invalidated when the port's tagged/untagged flag changes; only the next
   promotion sees the new state. The 934 worker is still inspection-only.
-- **Counters** are not exported; there is no debugfs file for `fdb_stats`
-  yet.
+- **Counters** were not exported at the time of 935; 936 adds the subset
+  relevant to the RX trigger to `ppe/config` (see below).
 - No hardware has run any of this. The verification below is compile-only.
 
 ### Verification of 935
@@ -324,3 +325,114 @@ retire them.
   remain (`pcs-airoha-common.c:1426`, `airoha_ppe_debugfs.c:217`). The arm64
   defconfig also prints its usual `symbol value 'm' invalid for RFKILL`
   line; that is not from this series.
+
+## Stage 3 — the missing RX trigger (936)
+
+`936-net-airoha-bridge-trigger-fdb-promotion-from-rx.patch` (md5
+`0c88c5dc62958b573b3c374b8823b232`) makes the bridge FDB promote path
+reachable from a pure bridge. It is generated on top of the repaired
+931–935 series: 931 with the on-demand NPU attach worker, the restored 932,
+and the unchanged 933/934/935.
+
+### Measured problem
+
+On the HG5382A the bridge FDB reaches the driver (`bridge -c fdb show` marks
+the lan1 entry `offload`) but `npu_attached` stays 0,
+`/sys/kernel/debug/ppe/entries` contains no `BRIDGE` entry, and 300
+lan3(DSA)→lan1(GDM) unicast frames are all forwarded by the software bridge.
+
+There are two reasons:
+
+1. `airoha_eth.c` only calls `airoha_ppe_check_skb()` for the
+   `HIT_UNBIND_RATE_REACHED` (0x0f) CPU reason. That reason means the PPE has
+   already learned an entry and wants it bound; it is not the reason of the
+   first frame of a flow.
+2. `airoha_ppe_hw_init()` — the only writer of `PPE_TB_HASH_CFG` (table
+   enable), `PPE_TB_CFG_SEARCH_MISS` (forward-and-build) and
+   `PPE_BIND_RATE` (`L2B_BIND`) — runs only from
+   `airoha_ppe_offload_setup()`, i.e. from the NPU attach performed by the
+   nft flowtable path. A pure bridge never attaches the NPU, so the PPE is
+   never programmed to create the unbound L2B slot. `npu_attached` is the
+   symptom, not just a consequence.
+
+### What 936 does
+
+- Adds `AIROHA_PPE_CPU_REASON_*` to `airoha_eth.h` with only the
+  no-entry/software-forward reasons: `NO_FLOW` 0x07, `UN_HIT` 0x0d,
+  `HIT_UNBIND` 0x0e, `HIT_UNBIND_RATE_REACHED` 0x0f and `HIT_PRE_BIND`
+  0x1a. Exception reasons (TTL, fragments, option headers, VLAN violation,
+  ...) are deliberately absent and stay with the software bridge. Only 0x0f
+  is confirmed by the existing driver; the other four values follow the
+  shared MediaTek-lineage encoding and have not been measured on an AN7581.
+  The slot/eligibility validation below keeps a wrong reason from committing
+  anything, but a board test should read `fdb_rx_no_flow` first.
+- `airoha_eth.c` switches on the reason. 0x0f keeps the existing
+  `airoha_ppe_check_skb()` path unchanged. 0x07/0x0d/0x0e/0x1a call the new
+  `airoha_ppe_bridge_rx_slowpath()`, except for PON ingress. A frame is
+  dispatched to exactly one of the two paths.
+- `airoha_ppe_bridge_fdb_update()` schedules the existing NPU attach work
+  item after a successful FDB insert, so `airoha_ppe_hw_init()` runs before
+  the first bridged frame. The RX slow path schedules the same worker as a
+  fallback. Nothing attaches in softirq; the worker still takes
+  `flow_offload_mutex`, loads the NPU firmware and programs the PPE in
+  process context.
+- Adds `fdb_stats.rx_no_flow` (no-flow reasons seen on a bridged path) and
+  `fdb_stats.rx_no_slot` (no usable unbound L2B slot). With `promoted` and
+  `no_npu` they distinguish "trigger never ran" from "ran but the PPE had no
+  slot". `promoted`, `no_entry`, `no_npu`, `rx_no_flow` and `rx_no_slot` are
+  printed by `/sys/kernel/debug/ppe/config` next to `npu_attached`, so a
+  board test can tell which case happened without a debugger.
+
+### Hash/slot finding (why no hash is synthesized)
+
+For the 0x0f path the descriptor's `AIROHA_RXD4_FOE_ENTRY` index points at
+the hardware-learned L2B entry that the PPE wants bound.
+`airoha_ppe_foe_commit_subflow_entry()` relies on that: on AN7581 it
+preserves the whole learned native `l2b` key (destination/source MAC,
+`ingress_vlan`, the opaque `l2b.key`) and only copies `data`, `ib2`,
+`vlan1`, `vlan2` and `etype` from the software template (930's fix).
+
+For a no-flow frame the index is only usable under the same condition: the
+slot must still hold this frame's unbound `BRIDGE` entry. The driver cannot
+synthesize a native L2B entry from the frame alone. The
+`airoha_ppe_foe_get_entry_hash()` helper produces a slot number, not the
+`l2b.key`/`ingress_vlan` that the hardware compares, and the descriptor
+carries no copy of them. Writing a software `struct airoha_foe_bridge`
+template into the slot would be interpreted as an `airoha_foe_l2b` entry and
+corrupt the learned source MAC, which is exactly the defect 930 fixed.
+
+So 936 does not invent a hash. It validates the descriptor index against
+`ppe_hash_mask` and `airoha_ppe_foe_is_bridge_slowpath()` (state != BIND,
+packet type BRIDGE) under `ppe_lock`, and only then calls the existing
+promote. If the slot is empty or foreign, the frame is counted in
+`rx_no_slot` and stays with the software bridge. The first frame can therefore
+be promoted only when the PPE created the unbound slot for it — which is why
+the FDB add path now attaches and programs the PPE before traffic. There is
+no half-working path that silently does nothing: the trigger and the two
+failure cases are counted.
+
+The input filter accepts a bridge port (`netif_is_bridge_port()`) and also a
+DSA conduit (`netdev_uses_dsa()`). A frame from a DSA user port reaches the
+driver on the conduit, which is not itself the bridge port; the FDB lookup
+still resolves the real egress by destination MAC. Without the DSA case the
+lan3(DSA)→lan1(GDM) test would skip every frame at the first check.
+
+### Verification of 936
+
+- Repaired series 931→935 reproduces the flashed `r0-98c1895` tree: after
+  applying the repaired 931 (attach) + restored 932 + 933/934/935 onto
+  `553902f58`, the sha256 of `airoha_eth.c`, `airoha_eth.h` and
+  `airoha_ppe.c` is identical to `~/kbuild/tree-verify`:
+  - eth.c `62c14963543ba27c4b0de57243cdb8cfc54550c8b26bccf19648757237cea8cd`
+  - eth.h `4228c241c1da493b953a5470e4943a53e4ce7c189f325c6c535f4b235f2e1a7e`
+  - ppe.c `0bafafa15f1278548d44afe400c0a5aef8f02fc25e5f3055ecfe199d857f18cc`
+- 936 applies after that series with `git apply --check`/`git apply` rc=0.
+- Driver compile in both configurations: `CONFIG_A_BUILD_RC=0` and
+  `CONFIG_B_BUILD_RC=0`; only the two pre-existing warnings
+  (`pcs-airoha-common.c:1426`, `airoha_ppe_debugfs.c:217`). Log:
+  `~/kbuild/logs/38-936-build-both.log`.
+- Not verified on hardware: whether the AN7581 PPE reports a no-flow reason
+  for the first bridged frame *and* leaves the unbound L2B slot at the
+  reported index. If it does, `rx_no_flow` and `promoted` rise; if the slot
+  is absent, `rx_no_slot` rises and the frame stays in software. That is the
+  first thing to read from a new build on the HG5382A.
