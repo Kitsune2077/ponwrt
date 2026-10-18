@@ -1,0 +1,281 @@
+From: Kitsune <km2077@foxmail.com>
+Subject: [PATCH] net: airoha: accept native L2B entries from the bridge slow path
+
+936/937 left the bridge RX slow path rejecting every hardware-learned
+L2B entry on the HG5382A. The 937 ring captured 32 identical records for
+bridged unicast frames:
+
+  hash=05bc reason=0x0e ib1=10000219 ib2@44=00000000 state=1 type=0 reject=TYPE
+
+and the reason histogram was dominated by 0x0e (1431) and 0x0f (901).
+That record is an unbound native L2B entry: bit 28 sets state UNBIND in
+AIROHA_FOE_IB1_BIND_STATE, and the varying low bits (0x219, 0x319, ...
+0x1719) are AIROHA_FOE_IB1_UNBIND_PACKETS/TIMESTAMP, not a packet type.
+The gate used the software bridge template field
+AIROHA_FOE_IB1_BIND_PACKET_TYPE, which is zero in a native entry, so it
+rejected a perfectly usable slot as TYPE.
+
+Make the gate layout-aware. A native AN7581 L2B entry is accepted when
+the index is valid, the state is not BIND, AIROHA_FOE_IB1_PKT_TYPE has
+the value the hardware leaves for the native table, and the native
+ingress key (destination MAC at 4/10, source MAC at 16/22) matches the
+frame being punted. The software bridge template keeps its existing
+PPE_PKT_TYPE_BRIDGE check.
+
+Carry the chosen layout into airoha_ppe_foe_commit_subflow_entry() so a
+native entry only gets data/ib2/vlan1/vlan2/etype written; the
+hardware-learned destination/source MAC, ingress VLAN and opaque
+l2b.key are preserved. The nft-rate path (0x0f) uses the same helper, so
+it no longer treats a native entry as an IPv4/L4 bucket.
+
+All existing guards stay: range check, state != BIND, the FDB ownership
+and egress re-check, spin_lock_bh(&ppe_lock), GFP_ATOMIC and no sleep in
+the RX path. Rejected slots still increment fdb_rx_no_slot and stay with
+the software bridge. REG_PPE_UNBIND_AGE is already 03e80003
+(MIN_PACKETS=1000, DELTA=3) on the board and is not touched.
+
+This is 938-net-airoha-accept-native-l2b-slowpath.patch.
+
+Signed-off-by: Kitsune <km2077@foxmail.com>
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index 5515660c4..a30c982b8 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -342,6 +342,15 @@ struct airoha_foe_mac_info {
+ #define AIROHA_FOE_IB1_BIND_UDP			BIT(30)
+ #define AIROHA_FOE_IB1_BIND_STATE		GENMASK(29, 28)
+ #define AIROHA_FOE_IB1_BIND_PACKET_TYPE		GENMASK(27, 25)
++/* AN7581 native L2B entries do not mirror the software bridge packet type
++ * in ib1: a bridged-unicast entry measured on the HG5382A is 0x10000219
++ * (state UNBIND, bits 27:25 and the software bridge type byte both zero).
++ * The L2B table itself is the type, so the native entry is identified by
++ * its ingress key instead of PPE_PKT_TYPE_BRIDGE. AIROHA_FOE_PKT_TYPE_L2B
++ * is the value the hardware leaves in that field for such an entry.
++ */
++#define AIROHA_FOE_IB1_PKT_TYPE			GENMASK(27, 25)
++#define AIROHA_FOE_PKT_TYPE_L2B			0
+ #define AIROHA_FOE_IB1_BIND_TTL			BIT(24)
+ #define AIROHA_FOE_IB1_BIND_TUNNEL_DECAP	BIT(23)
+ #define AIROHA_FOE_IB1_BIND_PPPOE		BIT(22)
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index 4eca16ff0..f88d04954 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1059,7 +1059,7 @@ void airoha_ppe_remove_egress_flows(struct airoha_gdm_dev *dev)
+ static int
+ airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *ppe,
+ 				    struct airoha_flow_table_entry *e,
+-				    u32 hash, bool rx_wlan)
++				    u32 hash, bool rx_wlan, bool native_l2b)
+ {
+ 	u32 mask = AIROHA_FOE_IB1_BIND_PACKET_TYPE | AIROHA_FOE_IB1_BIND_UDP;
+ 	struct airoha_foe_entry *hwe_p, hwe;
+@@ -1082,6 +1082,18 @@ airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *ppe,
+ 	hwe.ib1 = (hwe.ib1 & mask) | (e->data.ib1 & ~mask);
+ 
+ 	type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe.ib1);
++	if (native_l2b) {
++		/* AN7581 native L2B entry: ib1 has no packet type here. Keep the
++		 * hardware-learned key (destination/source MAC, ingress VLAN and
++		 * the opaque l2b.key) and copy only the egress action fields.
++		 */
++		hwe.l2b.data = e->data.bridge.data;
++		hwe.l2b.ib2 = e->data.bridge.ib2;
++		hwe.l2b.vlan1 = e->data.bridge.l2.common.vlan1;
++		hwe.l2b.vlan2 = e->data.bridge.l2.common.vlan2;
++		hwe.l2b.etype = e->data.bridge.l2.common.etype;
++		goto commit;
++	}
+ 	if (airoha_is_7581(ppe->eth) && type == PPE_PKT_TYPE_BRIDGE) {
+ 		/* Preserve the hardware-learned ingress key, including source MAC. */
+ 		hwe.l2b.data = e->data.bridge.data;
+@@ -1133,6 +1145,10 @@ enum airoha_foe_slowpath {
+ 	AIROHA_FOE_SLOWPATH_BRIDGE,
+ };
+ 
++static bool airoha_ppe_foe_is_native_l2b(struct airoha_ppe *ppe,
++					 struct airoha_foe_entry *hwe,
++					 const struct sk_buff *skb);
++
+ static enum airoha_foe_slowpath
+ airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe, struct sk_buff *skb,
+ 			    u32 hash, bool rx_wlan)
+@@ -1140,7 +1156,7 @@ airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe, struct sk_buff *skb,
+ 	struct airoha_flow_table_entry *e;
+ 	struct airoha_foe_bridge br = {};
+ 	struct airoha_foe_entry *hwe;
+-	bool commit_done = false, bridge_miss = false;
++	bool commit_done = false, bridge_miss = false, native_l2b = false;
+ 	struct hlist_node *n;
+ 	u32 index, state;
+ 
+@@ -1155,6 +1171,11 @@ airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe, struct sk_buff *skb,
+ 		goto unlock;
+ 
+ 	/* Native L2B uses its learned key, not an IPv4/L4 software hash bucket. */
++	if (airoha_ppe_foe_is_native_l2b(ppe, hwe, skb)) {
++		bridge_miss = true;
++		native_l2b = true;
++		goto l2_lookup;
++	}
+ 	if (airoha_is_7581(ppe->eth) &&
+ 	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1) ==
+ 	    PPE_PKT_TYPE_BRIDGE) {
+@@ -1189,7 +1210,8 @@ airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe, struct sk_buff *skb,
+ 	e = rhashtable_lookup_fast(&ppe->l2_flows, &br,
+ 				   airoha_l2_flow_table_params);
+ 	if (e) {
+-		airoha_ppe_foe_commit_subflow_entry(ppe, e, hash, rx_wlan);
++		airoha_ppe_foe_commit_subflow_entry(ppe, e, hash, rx_wlan,
++						    native_l2b);
+ 		commit_done = true;
+ 	}
+ unlock:
+@@ -1360,12 +1382,50 @@ static void airoha_ppe_bridge_fdb_flush(struct airoha_ppe *ppe)
+ 	}
+ }
+ 
++/* AN7581 hardware-created L2B entries have no packet type in ib1. The
++ * measured bridged-unicast entry is ib1=0x10000219: state UNBIND, the
++ * unbound packet/timestamp counters in the low bits, and bit 24 clear.
++ * Identify the native layout by its ingress key instead: the destination
++ * MAC is split 4+2 bytes at offset 4/10 and the source MAC 4+2 bytes at
++ * 16/22, unlike the software bridge template. A slot that does not hold
++ * this frame's (source, destination) pair is foreign and is left alone.
++ *
++ * Caller must hold ppe_lock.
++ */
++static bool airoha_ppe_foe_is_native_l2b(struct airoha_ppe *ppe,
++					 struct airoha_foe_entry *hwe,
++					 const struct sk_buff *skb)
++{
++	const struct ethhdr *eh = eth_hdr(skb);
++
++	if (!airoha_is_7581(ppe->eth))
++		return false;
++
++	if (FIELD_GET(AIROHA_FOE_IB1_PKT_TYPE, hwe->ib1) !=
++	    AIROHA_FOE_PKT_TYPE_L2B)
++		return false;
++
++	return READ_ONCE(hwe->l2b.dest_mac_hi) ==
++			get_unaligned_be32(eh->h_dest) &&
++	       READ_ONCE(hwe->l2b.dest_mac_lo) ==
++			get_unaligned_be16(eh->h_dest + 4) &&
++	       READ_ONCE(hwe->l2b.src_mac_hi) ==
++			get_unaligned_be32(eh->h_source) &&
++	       READ_ONCE(hwe->l2b.src_mac_lo) ==
++			get_unaligned_be16(eh->h_source + 4);
++}
++
+ /* True while @hash still holds the unbound, hardware-learned L2B entry of
+- * the frame that triggered the RX slow path. Caller must hold ppe_lock.
++ * the frame that triggered the RX slow path. @native_l2b, when not NULL,
++ * tells whether the entry uses the native AN7581 layout (no packet type)
++ * or the software bridge template. Caller must hold ppe_lock.
+  */
+-static bool airoha_ppe_foe_is_bridge_slowpath(struct airoha_ppe *ppe, u32 hash)
++static bool airoha_ppe_foe_is_bridge_slowpath(struct airoha_ppe *ppe,
++					      const struct sk_buff *skb,
++					      u32 hash, bool *native_l2b)
+ {
+ 	struct airoha_foe_entry *hwe;
++	u32 type;
+ 
+ 	hwe = airoha_ppe_foe_get_entry_locked(ppe, hash);
+ 	if (!hwe)
+@@ -1375,9 +1435,23 @@ static bool airoha_ppe_foe_is_bridge_slowpath(struct airoha_ppe *ppe, u32 hash)
+ 	    AIROHA_FOE_STATE_BIND)
+ 		return false;
+ 
+-	/* Only L2B entries are bridging candidates. */
+-	return FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1) ==
+-	       PPE_PKT_TYPE_BRIDGE;
++	type = FIELD_GET(AIROHA_FOE_IB1_PKT_TYPE, hwe->ib1);
++
++	/* A software bridge template carries the type in ib1. */
++	if (type == PPE_PKT_TYPE_BRIDGE) {
++		if (native_l2b)
++			*native_l2b = false;
++		return true;
++	}
++
++	/* Native L2B entries have no packet type, only state and key. */
++	if (airoha_ppe_foe_is_native_l2b(ppe, hwe, skb)) {
++		if (native_l2b)
++			*native_l2b = true;
++		return true;
++	}
++
++	return false;
+ }
+ 
+ /* Attach the NPU on demand for the bridge path.
+@@ -1432,7 +1506,7 @@ static void airoha_ppe_bridge_fdb_promote(struct airoha_ppe *ppe,
+ 	struct net_device *egress;
+ 	struct ethhdr *eh = eth_hdr(skb);
+ 	bool ingress_tagged, tag_in_packet = false, push = false;
+-	bool ingress_8021q = true;
++	bool ingress_8021q = true, native_l2b = false;
+ 	u16 vid = 0;
+ 	int err;
+ 
+@@ -1670,7 +1744,7 @@ static void airoha_ppe_bridge_fdb_promote(struct airoha_ppe *ppe,
+ 	fdb = rhashtable_lookup_fast(&ppe->fdb_table, &key,
+ 				     airoha_fdb_table_params);
+ 	if (!fdb || fdb->egress != egress ||
+-	    !airoha_ppe_foe_is_bridge_slowpath(ppe, hash))
++	    !airoha_ppe_foe_is_bridge_slowpath(ppe, skb, hash, &native_l2b))
+ 		goto out_free;
+ 
+ 	/* A concurrent insertion of the same (source MAC, destination MAC)
+@@ -1681,8 +1755,8 @@ static void airoha_ppe_bridge_fdb_promote(struct airoha_ppe *ppe,
+ 	prev = rhashtable_lookup_fast(&ppe->l2_flows, &e->data.bridge,
+ 				      airoha_l2_flow_table_params);
+ 	if (prev) {
+-		err = airoha_ppe_foe_commit_subflow_entry(ppe, prev, hash,
+-							  false);
++		err = airoha_ppe_foe_commit_subflow_entry(ppe, prev, hash, false,
++							  native_l2b);
+ 		goto out_free;
+ 	}
+ 
+@@ -1690,7 +1764,8 @@ static void airoha_ppe_bridge_fdb_promote(struct airoha_ppe *ppe,
+ 	if (err)
+ 		goto out_free;
+ 
+-	err = airoha_ppe_foe_commit_subflow_entry(ppe, e, hash, false);
++	err = airoha_ppe_foe_commit_subflow_entry(ppe, e, hash, false,
++						  native_l2b);
+ 	if (err) {
+ 		/* Undo the l2_flows insertion: the destination keeps being
+ 		 * forwarded by the software bridge and the next frame retries.
+@@ -1827,6 +1902,7 @@ void airoha_ppe_bridge_rx_slowpath(struct airoha_eth *eth,
+ {
+ 	struct airoha_foe_entry *hwe = NULL;
+ 	struct airoha_ppe *ppe = eth->ppe;
++	bool bridge_slowpath = false;
+ 	u32 ppe_hash_mask, ib1 = 0, ib2 = 0;
+ 	u32 state = AIROHA_FOE_STATE_INVALID, type = 0;
+ 
+@@ -1874,7 +1950,9 @@ void airoha_ppe_bridge_rx_slowpath(struct airoha_eth *eth,
+ 		 */
+ 		ib2 = READ_ONCE(hwe->l2b.ib2);
+ 		state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, ib1);
+-		type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, ib1);
++		type = FIELD_GET(AIROHA_FOE_IB1_PKT_TYPE, ib1);
++		bridge_slowpath =
++			airoha_ppe_foe_is_bridge_slowpath(ppe, skb, hash, NULL);
+ 	}
+ 	spin_unlock_bh(&ppe_lock);
+ 
+@@ -1893,7 +1971,7 @@ void airoha_ppe_bridge_rx_slowpath(struct airoha_eth *eth,
+ 		return;
+ 	}
+ 
+-	if (type != PPE_PKT_TYPE_BRIDGE) {
++	if (!bridge_slowpath) {
+ 		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.rx_no_slot);
+ 		airoha_ppe_l2b_dbg_record(ppe, skb, hash, reason, ib1, ib2,
+ 					  state, type, AIROHA_L2B_REJECT_TYPE);

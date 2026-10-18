@@ -533,17 +533,45 @@ How to read the first `l2b_dbg` records:
 | `reason[0x07]` not the dominant index | the assumed no-flow reason is wrong | use the histogram to find the real reason |
 | `unbind_age=00000000` | hardware has no unbound ageing configuration | candidate one-line follow-up: program `MIN_PACKETS`/`DELTA` |
 
+### What the board measured (937)
+
+The first 937 run on the HG5382A captured the same record 32 times for
+bridged unicast frames (lan3 DSA → lan1 GDM) before our own traffic:
+
+```text
+idx ifindex hash reason ib1      ib2@44   state type bridge reject jiffies
+01  2       05bc 0e     10000219 00000000 1     0    0      TYPE   4294939915
+02  2       05bc 0e     10000319 00000000 1     0    0      TYPE   4294939915
+03  2       05bc 0e     10000419 00000000 1     0    0      TYPE   4294939915
+...
+24  2       05bc 0e     10001719 00000000 1     0    0      TYPE   4294939934
+```
+
+`ib1` is `0x1000XXXX`: bit 28 sets state UNBIND, and the low 13 bits are
+`AIROHA_FOE_IB1_UNBIND_PACKETS` (2, 3, ... 23 at bits 23:8) and
+`AIROHA_FOE_IB1_UNBIND_TIMESTAMP` (0x19 at bits 7:0), not a packet type.
+The raw reason histogram was dominated by `0x0e` HIT_UNBIND (1431) and
+`0x0f` HIT_UNBIND_RATE_REACHED (901); the other reasons were 0x0d (173),
+0x0c (89), 0x03 (63) and 0x07 (7). The hardware therefore does create
+the native L2B entry and punts it correctly. The PPE registers were
+`unbind_age=03e80003` (MIN_PACKETS 1000, DELTA 3), `bind_rate=001e001e`
+(L2B_BIND 30, BIND 30), `tb_cfg=83c0cfb4` (SEARCH_MISS 3),
+`hash_cfg=30001101`, `hash_seed=12345678`, `npu_attached=1`, `num_ppe=2`.
+
+The gate rejected every one of those frames as `TYPE`: it decoded the
+packet type with `AIROHA_FOE_IB1_BIND_PACKET_TYPE` (bits 27:25), the
+field used by the software bridge template, but the native entry has no
+such field there. The state decode was already right; the type decode
+was not. `REG_PPE_UNBIND_AGE` is already programmed to 1000/3, so the
+ageing hypothesis is dead and 938 must not touch it.
+
 ### What still must be confirmed on hardware
 
-- Whether the AN7581 PPE builds an L2B entry for bridged frames at all,
-  and at which descriptor index it reports it.
-- Which CPU reason the AN7581 uses for the first bridged frame (the
-  histogram answers this; 0x07/0x0d/0x0e/0x1a were inherited from the
-  MediaTek lineage and were never measured on this SoC).
-- Whether `REG_PPE_UNBIND_AGE` is nonzero and whether the hardware ages
-  the unbound entry out before NAPI runs.
 - Native `l2b.key` semantics, if a self-build is ever revisited: the
-  field is still not defined by the tree.
+  field is still not defined by the tree. 938 preserves it untouched.
+- Whether the native ingress-key offsets used by the layout check are
+  stable across AN7581 variants; the measured HG5382A entry follows the
+  layout asserted by 930.
 
 ### Fallback (unchanged)
 
@@ -563,3 +591,60 @@ L2B path cannot be made to create the slot.
   format warning, now at `airoha_ppe_debugfs.c:246`).
 - No hardware write, no new commit path and no change to `fdb_stats`;
   the first 32 rejects and the reason histogram are the only new state.
+
+## Stage 5 — 938: accept the native L2B entry
+
+`938-net-airoha-accept-native-l2b-slowpath.patch` (md5
+`5041a01b27766210a070d1b3c5eac6fe`) makes the slow-path gate
+layout-aware. It is the fix for the layout mistake measured by 937; it
+does not write a PPE register and does not change the FDB key.
+
+### What the gate now reads
+
+- `airoha_ppe_foe_is_native_l2b()` accepts a hardware-learned entry only
+  on AN7581, and only when:
+  - `FIELD_GET(AIROHA_FOE_IB1_PKT_TYPE, ib1)` has the value the
+    hardware leaves for the native table (`AIROHA_FOE_PKT_TYPE_L2B`,
+    measured zero), and
+  - the state is not `AIROHA_FOE_STATE_BIND` (already checked by the
+    caller), and
+  - the native ingress key matches the frame: `l2b.dest_mac_hi` /
+    `l2b.dest_mac_lo` (offset 4/10) and `l2b.src_mac_hi` /
+    `l2b.src_mac_lo` (offset 16/22). A slot that does not hold this
+    frame's `(source, destination)` pair is foreign and stays rejected.
+- `airoha_ppe_foe_is_bridge_slowpath()` keeps the software bridge
+  `PPE_PKT_TYPE_BRIDGE` test for entries written by the driver and uses
+  the native helper for the hardware-learned layout.
+- `airoha_ppe_foe_commit_subflow_entry()` now takes the chosen layout.
+  For a native entry it writes only `l2b.data`, `l2b.ib2`, `l2b.vlan1`,
+  `l2b.vlan2` and `l2b.etype`; the hardware-learned destination/source
+  MACs, ingress VLAN and opaque `l2b.key` are not touched. The `0x0f`
+  `HIT_UNBIND_RATE_REACHED` path uses the same helper and layout, so it
+  no longer treats the native entry as an IPv4/L4 hash bucket.
+- Range, `state != BIND`, the FDB ownership and egress re-check,
+  `spin_lock_bh(&ppe_lock)`, `GFP_ATOMIC` and the no-sleep rule in the
+  RX path are unchanged. A rejected frame still increments
+  `fdb_rx_no_slot` and stays with the software bridge; `fdb_promoted`
+  rises only after the commit reached the PPE. The 937 ring and reject
+  breakdown (RANGE/NO_ENTRY/BIND/TYPE) are kept and simply stop
+  recording once the gate accepts.
+
+### What is deliberately not changed
+
+`REG_PPE_UNBIND_AGE` is already `03e80003` (`MIN_PACKETS=1000`,
+`DELTA=3`) on the HG5382A and stays untouched. `l2b.key` is not written
+and not synthesized; the hardware owns it. No software L2B entry is
+built.
+
+### Verification of 938
+
+- Applies after 931→937 on a clean `553902f58` worktree with
+  `git apply --check`/`git apply` rc=0 (tree `~/kbuild/tree-938-apply`);
+  the result matches the edited `tree-938` byte for byte.
+- Driver compile in both configurations on `~/kbuild/tree-938`
+  (`~/kbuild/logs/41-938-build-both.log`): `CONFIG_A_BUILD_RC=0` and
+  `CONFIG_B_BUILD_RC=0`; only the same two pre-existing warnings
+  (`pcs-airoha-common.c:1426` and the `ppe%u_gdm2_default_cpu_port`
+  format warning in `airoha_ppe_debugfs.c`).
+- The image is built by the normal `make target/install` flow, not
+  repacked.
