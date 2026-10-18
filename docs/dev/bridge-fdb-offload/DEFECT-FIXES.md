@@ -648,3 +648,93 @@ built.
   format warning in `airoha_ppe_debugfs.c`).
 - The image is built by the normal `make target/install` flow, not
   repacked.
+
+## Stage 6 — 939: make the diagnostic catch the test frames
+
+`939-net-airoha-wrap-l2b-dbg-ring.patch` (md5
+`bb115a9533de6d900a107ff9d86091da`) is **instrumentation only** once
+more: it does not write a PPE or FOE entry, does not start a commit and
+does not change the 938 gate or the forwarding decision.
+
+### Why the ring has to wrap
+
+938 made the gate layout-aware, but the HG5382A still refused every
+bridged test frame: after 300 frames `fdb_rx_no_slot` rose by the same
++456 as `fdb_rx_no_flow`, `fdb_promoted` stayed 0 and no BRIDGE entry
+appeared. 937 kept only the **first 32** refused frames after boot, and
+on this board those slots were already full of ambient traffic
+(`type=4/5`, IPv4/L4 entries) before the test started. A saturating
+"first N" ring therefore cannot capture the frames under test, no
+matter how long the run is.
+
+939 turns the array into a wrapping ring: once all 32 slots have been
+written the next record overwrites the oldest one, so the file always
+holds the **last 32** refused frames. `recorded` is still the number of
+valid slots, `total` is the lifetime record count and every record
+carries its `seq` (the `total` value when it was written). Debugfs
+starts at `head` when the ring is full and prints oldest to newest.
+
+### What a record now holds
+
+- The 937 fields: descriptor `AIROHA_RXD4_FOE_ENTRY`, raw
+  `AIROHA_RXD4_PPE_CPU_REASON`, raw `ib1`, the word at the native L2B
+  `ib2` offset (44), parsed `state`/`type`, ingress `ifindex`,
+  `jiffies` and the reject reason.
+- A raw dump of the candidate entry: 16 u32 words, **entry bytes
+  0..63**, printed as four `raw+NN` lines. The copy is taken under the
+  existing `ppe_lock` through `airoha_ppe_foe_get_entry_locked()`,
+  before the lock is dropped; debugfs never dereferences the DMA entry.
+  If 930's native layout is wrong, the dump shows where the
+  hardware-learned destination/source MACs really are.
+- `entry_dst`/`entry_src`, reconstructed from the same `l2b` fields the
+  gate compares (offset 4/10 and 16/22), plus the frame's `skb_dst` and
+  `skb_src` from `eth_hdr()`. A MAC-ownership mismatch is visible in
+  the row without decoding the dump.
+
+### Counters
+
+Next to the `fdb_*` totals, `l2b_dbg` prints:
+
+```text
+l2b_reject: RANGE=... NO_ENTRY=... BIND=... TYPE=... KEY=... ACCEPTED=...
+```
+
+`RANGE`, `NO_ENTRY`, `BIND` and `TYPE` are the 937 categories. `KEY` is
+new: the slot has the native L2B layout but its destination/source MACs
+do not match this frame, i.e. the mismatch inside
+`airoha_ppe_foe_is_native_l2b()`. `ACCEPTED` counts the candidates where
+the gate passed and the commit was about to be attempted. The counters
+count every rejection, including records that have already wrapped, so
+`total` should equal `RANGE + NO_ENTRY + BIND + TYPE + KEY`.
+
+### What to read on the board
+
+```sh
+cat /sys/kernel/debug/ppe/l2b_dbg
+```
+
+- `total` grows with every refused frame while `recorded` saturates at
+  32: the printed rows are the **last** 32, not the first.
+- `KEY` with `entry_dst != skb_dst` or `entry_src != skb_src` means the
+  slot the descriptor points at belongs to another MAC pair; 938's key
+  assumption is then wrong for this path. Compare the raw dump to find
+  the real offsets.
+- `RANGE` dominating still means the descriptor index is the `0xffff`
+  sentinel; `NO_ENTRY` and `BIND` keep their 937 meaning.
+- `ACCEPTED` rising while `fdb_promoted` stays 0 moves the failure to
+  the FDB/VLAN/egress side, where 938 already logs the error.
+
+### Verification of 939
+
+- Applies after 931→938 on a clean `553902f58` worktree with
+  `git apply --check`/`git apply` rc=0 for every patch
+  (`~/kbuild/logs/42-939-apply-check.log`); the result matches the
+  edited `tree-938-gen` byte for byte and leaves no `.rej`.
+- Driver compile in both configurations
+  (`~/kbuild/logs/43-939-build-both.log`):
+  `CONFIG_A_BUILD_RC=0`, `CONFIG_B_BUILD_RC=0`; only the same two
+  pre-existing warnings (`pcs-airoha-common.c:1426` and the
+  `ppe%u_gdm2_default_cpu_port` format warning in
+  `airoha_ppe_debugfs.c:246`).
+- The image is built by the normal `make target/install` flow, not
+  repacked.

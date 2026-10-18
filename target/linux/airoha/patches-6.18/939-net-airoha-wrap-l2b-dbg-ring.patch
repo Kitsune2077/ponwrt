@@ -1,0 +1,567 @@
+From: Kitsune <km2077@foxmail.com>
+Subject: [PATCH] net: airoha: wrap the L2B diagnostic ring and dump the slot
+
+938 made the slow-path gate accept a native L2B entry, but the HG5382A
+still rejects every bridged test frame: after 300 frames fdb_rx_no_slot
+rose by the same +456 as fdb_rx_no_flow, fdb_promoted stayed 0 and no
+BRIDGE entry appeared. The 937 ring cannot explain that because it keeps
+the first 32 refused frames after boot, and those were all ambient traffic
+(type=4/5 IPv4/L4 entries); the test frames arrive later and are never
+recorded.
+
+Turn the 32-entry ring into a wrapping ring: once full, the next record
+overwrites the oldest slot, so l2b_dbg always shows the last 32 refused
+frames. recorded still reports how many slots are valid, a new total
+counter keeps the lifetime number of records and every record carries its
+sequence number.
+
+Extend each record with a raw dump of the candidate FOE entry: 16 u32
+words, offsets 0..63. The copy is taken under the existing ppe_lock through
+airoha_ppe_foe_get_entry_locked(), is read-only and is made before the lock
+is dropped, so debugfs never dereferences the DMA entry. This shows where
+the native destination/source MACs actually live if 930's layout
+assumption is wrong.
+
+Add per-reject counters next to the fdb_* totals: RANGE, NO_ENTRY, BIND,
+TYPE, KEY (the native layout was present but its MACs did not match this
+frame) and ACCEPTED (the gate passed and the commit was attempted). Print
+the two MACs the gate compares against the frame (entry_dst, entry_src)
+and the frame's own skb_dst, skb_src in the l2b_dbg row, so a key mismatch
+is visible without decoding the dump.
+
+Nothing else changes: no PPE or FOE write, no new commit path, no change
+to the forwarding decision or to the 938 layout check. Rejected frames
+still increment fdb_rx_no_slot and stay with the software bridge.
+
+This is 939-net-airoha-wrap-l2b-dbg-ring.patch.
+
+Signed-off-by: Kitsune <km2077@foxmail.com>
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index a30c982b8..f06ead82c 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -785,34 +785,53 @@ enum airoha_ppe_cpu_reason {
+ 	AIROHA_PPE_CPU_REASON_HIT_PRE_BIND		= 0x1a,
+ };
+ 
+-/* Maximum number of rejected bridge RX frames kept for /sys/kernel/debug/ppe/l2b_dbg.
+- * The RX path stops recording once the array is full; the running total stays
+- * available in fdb_stats.rx_no_flow/rx_no_slot.
++/* Number of rejected bridge RX frames kept for /sys/kernel/debug/ppe/l2b_dbg.
++ * The ring wraps: once every slot has been written the oldest record is
++ * overwritten, so the file always shows the last AIROHA_PPE_L2B_DBG_MAX
++ * rejected frames. l2b_dbg.total keeps the lifetime count. The RX path still
++ * performs no allocation.
+  */
+ #define AIROHA_PPE_L2B_DBG_MAX		32
+ 
++/* Number of u32 words of the candidate FOE entry captured per record: entry
++ * bytes 0..63. A whole PPE entry is 80 bytes; the first 64 cover ib1, the
++ * native ingress key and the native l2b.data/ib2 words.
++ */
++#define AIROHA_PPE_L2B_DBG_WORDS	16
++
+ /* Why the bridge RX slow path did not hand a descriptor slot to the promote
+  * path. Diagnostic only; nothing here changes forwarding.
+  */
+ enum airoha_ppe_l2b_reject {
+-	AIROHA_L2B_REJECT_RANGE = 1,	/* index outside the PPE table */
++	AIROHA_L2B_REJECT_RANGE = 0,	/* index outside the PPE table */
+ 	AIROHA_L2B_REJECT_NO_ENTRY,	/* index has no readable FOE entry */
+ 	AIROHA_L2B_REJECT_BIND,		/* slot is already bound */
+-	AIROHA_L2B_REJECT_TYPE,		/* slot is not PPE_PKT_TYPE_BRIDGE */
++	AIROHA_L2B_REJECT_TYPE,		/* slot is neither layout */
++	AIROHA_L2B_REJECT_KEY,		/* native layout, MACs do not match */
++	AIROHA_L2B_REJECT_MAX,
+ };
+ 
+ /* One rejected frame, captured verbatim from the descriptor and the FOE slot.
+  * Filled on the RX softirq from a static array, so it must not sleep.
+  */
+ struct airoha_ppe_l2b_dbg {
++	u64 seq;		/* l2b_dbg.total when this record was written */
+ 	u32 hash;		/* AIROHA_RXD4_FOE_ENTRY as reported */
+ 	u32 reason;		/* AIROHA_RXD4_PPE_CPU_REASON as reported */
+ 	u32 ib1;		/* raw slot word 0, 0 when no slot */
+ 	u32 ib2;		/* raw native L2B word at entry offset 44 */
+ 	u32 state;		/* FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, ib1) */
+-	u32 type;		/* FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, ib1) */
++	u32 type;		/* FIELD_GET(AIROHA_FOE_IB1_PKT_TYPE, ib1) */
+ 	u32 reject;		/* enum airoha_ppe_l2b_reject */
+ 	u32 ifindex;		/* ingress netdev, 0 when skb->dev is NULL */
++	/* Candidate entry bytes 0..63, captured under ppe_lock. */
++	u32 raw[AIROHA_PPE_L2B_DBG_WORDS];
++	/* The two MACs the native gate compares, read from the l2b layout. */
++	u8 entry_dst[ETH_ALEN];
++	u8 entry_src[ETH_ALEN];
++	/* The frame the gate compared them against. */
++	u8 skb_dst[ETH_ALEN];
++	u8 skb_src[ETH_ALEN];
+ 	unsigned long jiffies;	/* when the frame was seen */
+ };
+ 
+@@ -859,14 +878,21 @@ struct airoha_ppe {
+ 		unsigned long rx_no_slot;   /* no unbound L2B slot, promote skipped */
+ 	} fdb_stats;
+ 
+-	/* Diagnostic-only evidence for the bridge RX slow path. The ring is
+-	 * filled with the first AIROHA_PPE_L2B_DBG_MAX rejected frames and is
++	/* Diagnostic-only evidence for the bridge RX slow path. The ring wraps:
++	 * it always holds the last AIROHA_PPE_L2B_DBG_MAX refused frames and is
+ 	 * read through /sys/kernel/debug/ppe/l2b_dbg. No hardware writes and no
+ 	 * allocation in the RX path.
+ 	 */
+ 	struct {
+ 		struct airoha_ppe_l2b_dbg entry[AIROHA_PPE_L2B_DBG_MAX];
+-		u32 count;
++		u32 recorded;	/* valid records, at most L2B_DBG_MAX */
++		u32 head;	/* next slot to overwrite */
++		u64 total;	/* lifetime records, including wrapped ones */
++		/* Every gate rejection, by enum airoha_ppe_l2b_reject, plus
++		 * every accepted candidate that reached the commit attempt.
++		 */
++		atomic64_t reject_count[AIROHA_L2B_REJECT_MAX];
++		atomic64_t accepted;
+ 		spinlock_t lock;
+ 	} l2b_dbg;
+ 
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index f88d04954..c1ca74b4d 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1147,7 +1147,8 @@ enum airoha_foe_slowpath {
+ 
+ static bool airoha_ppe_foe_is_native_l2b(struct airoha_ppe *ppe,
+ 					 struct airoha_foe_entry *hwe,
+-					 const struct sk_buff *skb);
++					 const struct sk_buff *skb,
++					 bool *key_mismatch);
+ 
+ static enum airoha_foe_slowpath
+ airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe, struct sk_buff *skb,
+@@ -1171,7 +1172,7 @@ airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe, struct sk_buff *skb,
+ 		goto unlock;
+ 
+ 	/* Native L2B uses its learned key, not an IPv4/L4 software hash bucket. */
+-	if (airoha_ppe_foe_is_native_l2b(ppe, hwe, skb)) {
++	if (airoha_ppe_foe_is_native_l2b(ppe, hwe, skb, NULL)) {
+ 		bridge_miss = true;
+ 		native_l2b = true;
+ 		goto l2_lookup;
+@@ -1394,9 +1395,11 @@ static void airoha_ppe_bridge_fdb_flush(struct airoha_ppe *ppe)
+  */
+ static bool airoha_ppe_foe_is_native_l2b(struct airoha_ppe *ppe,
+ 					 struct airoha_foe_entry *hwe,
+-					 const struct sk_buff *skb)
++					 const struct sk_buff *skb,
++					 bool *key_mismatch)
+ {
+ 	const struct ethhdr *eh = eth_hdr(skb);
++	bool match;
+ 
+ 	if (!airoha_is_7581(ppe->eth))
+ 		return false;
+@@ -1405,26 +1408,37 @@ static bool airoha_ppe_foe_is_native_l2b(struct airoha_ppe *ppe,
+ 	    AIROHA_FOE_PKT_TYPE_L2B)
+ 		return false;
+ 
+-	return READ_ONCE(hwe->l2b.dest_mac_hi) ==
++	match = READ_ONCE(hwe->l2b.dest_mac_hi) ==
+ 			get_unaligned_be32(eh->h_dest) &&
+-	       READ_ONCE(hwe->l2b.dest_mac_lo) ==
++		READ_ONCE(hwe->l2b.dest_mac_lo) ==
+ 			get_unaligned_be16(eh->h_dest + 4) &&
+-	       READ_ONCE(hwe->l2b.src_mac_hi) ==
++		READ_ONCE(hwe->l2b.src_mac_hi) ==
+ 			get_unaligned_be32(eh->h_source) &&
+-	       READ_ONCE(hwe->l2b.src_mac_lo) ==
++		READ_ONCE(hwe->l2b.src_mac_lo) ==
+ 			get_unaligned_be16(eh->h_source + 4);
++
++	/* The slot has the native layout but belongs to another MAC pair. */
++	if (!match && key_mismatch)
++		*key_mismatch = true;
++
++	return match;
+ }
+ 
+ /* True while @hash still holds the unbound, hardware-learned L2B entry of
+  * the frame that triggered the RX slow path. @native_l2b, when not NULL,
+  * tells whether the entry uses the native AN7581 layout (no packet type)
+- * or the software bridge template. Caller must hold ppe_lock.
++ * or the software bridge template. @reject, when not NULL, receives the
++ * diagnostic reason for a false return: TYPE when the slot is neither
++ * layout, KEY when it has the native layout but another MAC pair.
++ * Caller must hold ppe_lock.
+  */
+ static bool airoha_ppe_foe_is_bridge_slowpath(struct airoha_ppe *ppe,
+ 					      const struct sk_buff *skb,
+-					      u32 hash, bool *native_l2b)
++					      u32 hash, bool *native_l2b,
++					      enum airoha_ppe_l2b_reject *reject)
+ {
+ 	struct airoha_foe_entry *hwe;
++	bool key_mismatch = false;
+ 	u32 type;
+ 
+ 	hwe = airoha_ppe_foe_get_entry_locked(ppe, hash);
+@@ -1445,12 +1459,16 @@ static bool airoha_ppe_foe_is_bridge_slowpath(struct airoha_ppe *ppe,
+ 	}
+ 
+ 	/* Native L2B entries have no packet type, only state and key. */
+-	if (airoha_ppe_foe_is_native_l2b(ppe, hwe, skb)) {
++	if (airoha_ppe_foe_is_native_l2b(ppe, hwe, skb, &key_mismatch)) {
+ 		if (native_l2b)
+ 			*native_l2b = true;
+ 		return true;
+ 	}
+ 
++	if (reject)
++		*reject = key_mismatch ? AIROHA_L2B_REJECT_KEY :
++					 AIROHA_L2B_REJECT_TYPE;
++
+ 	return false;
+ }
+ 
+@@ -1744,7 +1762,8 @@ static void airoha_ppe_bridge_fdb_promote(struct airoha_ppe *ppe,
+ 	fdb = rhashtable_lookup_fast(&ppe->fdb_table, &key,
+ 				     airoha_fdb_table_params);
+ 	if (!fdb || fdb->egress != egress ||
+-	    !airoha_ppe_foe_is_bridge_slowpath(ppe, skb, hash, &native_l2b))
++	    !airoha_ppe_foe_is_bridge_slowpath(ppe, skb, hash, &native_l2b,
++					       NULL))
+ 		goto out_free;
+ 
+ 	/* A concurrent insertion of the same (source MAC, destination MAC)
+@@ -1796,34 +1815,104 @@ static void airoha_ppe_bridge_fdb_promote(struct airoha_ppe *ppe,
+ 	mutex_unlock(&flow_offload_mutex);
+ }
+ 
++/* Snapshot of the candidate FOE entry taken under ppe_lock. The record in the
++ * debug ring is filled from this copy after the lock is dropped, so the RX path
++ * never dereferences the DMA entry outside the critical section.
++ */
++struct airoha_ppe_l2b_slot {
++	u32 ib1;
++	u32 ib2;
++	u32 state;
++	u32 type;
++	u32 raw[AIROHA_PPE_L2B_DBG_WORDS];
++	u8 dest[ETH_ALEN];
++	u8 src[ETH_ALEN];
++};
++
++/* Copy the candidate FOE entry, including the raw words at offsets 0..63, while
++ * ppe_lock is held. Read-only: no write reaches the PPE or the DMA table.
++ * The entry is cast to u32 because the union in struct airoha_foe_entry is
++ * naturally aligned and the raw dump must start at ib1 (offset 0).
++ *
++ * Caller must hold ppe_lock.
++ */
++static void airoha_ppe_l2b_dbg_capture_slot(struct airoha_foe_entry *hwe,
++					    struct airoha_ppe_l2b_slot *slot)
++{
++	const u32 *words = (const u32 *)hwe;
++	unsigned int i;
++
++	lockdep_assert_held(&ppe_lock);
++
++	slot->ib1 = READ_ONCE(hwe->ib1);
++	slot->ib2 = READ_ONCE(hwe->l2b.ib2);
++	slot->state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, slot->ib1);
++	slot->type = FIELD_GET(AIROHA_FOE_IB1_PKT_TYPE, slot->ib1);
++
++	for (i = 0; i < AIROHA_PPE_L2B_DBG_WORDS; i++)
++		slot->raw[i] = READ_ONCE(words[i]);
++
++	/* Same fields airoha_ppe_foe_is_native_l2b() compares. */
++	put_unaligned_be32(READ_ONCE(hwe->l2b.dest_mac_hi), slot->dest);
++	put_unaligned_be16(READ_ONCE(hwe->l2b.dest_mac_lo), slot->dest + 4);
++	put_unaligned_be32(READ_ONCE(hwe->l2b.src_mac_hi), slot->src);
++	put_unaligned_be16(READ_ONCE(hwe->l2b.src_mac_lo), slot->src + 4);
++}
++
+ /* Record one refused bridge RX frame. Diagnostic only: the slot is not
+- * touched, the frame keeps going to the software bridge and the ring is left
+- * alone once it is full.
++ * touched and the frame keeps going to the software bridge. The ring wraps, so
++ * the newest AIROHA_PPE_L2B_DBG_MAX records survive instead of the first ones
++ * seen after boot (which on the board were all ambient traffic). @slot is NULL
++ * when the descriptor index had no readable entry.
+  */
+ static void airoha_ppe_l2b_dbg_record(struct airoha_ppe *ppe,
+ 				      const struct sk_buff *skb,
+-				      u32 hash, u32 reason, u32 ib1, u32 ib2,
+-				      u32 state, u32 type,
++				      u32 hash, u32 reason,
++				      const struct airoha_ppe_l2b_slot *slot,
+ 				      enum airoha_ppe_l2b_reject reject)
+ {
+ 	struct airoha_ppe_l2b_dbg *e;
+ 	unsigned long flags;
++	u32 head;
+ 
+ 	spin_lock_irqsave(&ppe->l2b_dbg.lock, flags);
+ 
+-	if (ppe->l2b_dbg.count < ARRAY_SIZE(ppe->l2b_dbg.entry)) {
+-		e = &ppe->l2b_dbg.entry[ppe->l2b_dbg.count++];
+-		e->hash = hash;
+-		e->reason = reason;
+-		e->ib1 = ib1;
+-		e->ib2 = ib2;
+-		e->state = state;
+-		e->type = type;
+-		e->reject = reject;
+-		e->ifindex = skb->dev ? skb->dev->ifindex : 0;
+-		e->jiffies = jiffies;
++	head = ppe->l2b_dbg.head;
++	e = &ppe->l2b_dbg.entry[head];
++	ppe->l2b_dbg.head = (head + 1) % ARRAY_SIZE(ppe->l2b_dbg.entry);
++	if (ppe->l2b_dbg.recorded < ARRAY_SIZE(ppe->l2b_dbg.entry))
++		ppe->l2b_dbg.recorded++;
++	e->seq = ++ppe->l2b_dbg.total;
++
++	e->hash = hash;
++	e->reason = reason;
++	e->reject = reject;
++	e->ifindex = skb->dev ? skb->dev->ifindex : 0;
++	ether_addr_copy(e->skb_dst, eth_hdr(skb)->h_dest);
++	ether_addr_copy(e->skb_src, eth_hdr(skb)->h_source);
++	e->jiffies = jiffies;
++
++	if (slot) {
++		e->ib1 = slot->ib1;
++		e->ib2 = slot->ib2;
++		e->state = slot->state;
++		e->type = slot->type;
++		memcpy(e->raw, slot->raw, sizeof(e->raw));
++		ether_addr_copy(e->entry_dst, slot->dest);
++		ether_addr_copy(e->entry_src, slot->src);
++	} else {
++		e->ib1 = 0;
++		e->ib2 = 0;
++		e->state = AIROHA_FOE_STATE_INVALID;
++		e->type = 0;
++		memset(e->raw, 0, sizeof(e->raw));
++		eth_zero_addr(e->entry_dst);
++		eth_zero_addr(e->entry_src);
+ 	}
+ 
++	if ((unsigned int)reject < ARRAY_SIZE(ppe->l2b_dbg.reject_count))
++		atomic64_inc(&ppe->l2b_dbg.reject_count[reject]);
++
+ 	spin_unlock_irqrestore(&ppe->l2b_dbg.lock, flags);
+ }
+ 
+@@ -1885,9 +1974,10 @@ static void airoha_ppe_l2b_dbg_log_config(struct airoha_ppe *ppe)
+  * frame inside NAPI, so a slot that does not hold an unbound BRIDGE entry is
+  * counted and left to the software bridge instead of inventing a hash.
+  *
+- * The diagnostic ring records the first rejected frames so a board test can
+- * see whether the descriptor index is 0xffff ("hardware built nothing"), a
+- * valid unbound BRIDGE entry (the gate accepted it), or some other slot. It
++ * The diagnostic ring wraps and records the last rejected frames so a board
++ * test can see whether the descriptor index is 0xffff ("hardware built
++ * nothing"), a valid unbound BRIDGE entry (the gate accepted it), or some
++ * other slot, even when the interesting traffic arrives long after boot. It
+  * performs no hardware writes and does not change forwarding.
+  *
+  * The first frame can also race the asynchronous NPU attach. The attach runs
+@@ -1902,9 +1992,10 @@ void airoha_ppe_bridge_rx_slowpath(struct airoha_eth *eth,
+ {
+ 	struct airoha_foe_entry *hwe = NULL;
+ 	struct airoha_ppe *ppe = eth->ppe;
++	struct airoha_ppe_l2b_slot slot = {};
++	enum airoha_ppe_l2b_reject reject = AIROHA_L2B_REJECT_TYPE;
+ 	bool bridge_slowpath = false;
+-	u32 ppe_hash_mask, ib1 = 0, ib2 = 0;
+-	u32 state = AIROHA_FOE_STATE_INVALID, type = 0;
++	u32 ppe_hash_mask;
+ 
+ 	if (!ppe)
+ 		return;
+@@ -1935,8 +2026,7 @@ void airoha_ppe_bridge_rx_slowpath(struct airoha_eth *eth,
+ 	ppe_hash_mask = airoha_ppe_get_total_num_entries(ppe) - 1;
+ 	if (hash > ppe_hash_mask) {
+ 		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.rx_no_slot);
+-		airoha_ppe_l2b_dbg_record(ppe, skb, hash, reason, 0, 0,
+-					  AIROHA_FOE_STATE_INVALID, 0,
++		airoha_ppe_l2b_dbg_record(ppe, skb, hash, reason, NULL,
+ 					  AIROHA_L2B_REJECT_RANGE);
+ 		return;
+ 	}
+@@ -1944,40 +2034,39 @@ void airoha_ppe_bridge_rx_slowpath(struct airoha_eth *eth,
+ 	spin_lock_bh(&ppe_lock);
+ 	hwe = airoha_ppe_foe_get_entry_locked(ppe, hash);
+ 	if (hwe) {
+-		ib1 = READ_ONCE(hwe->ib1);
+-		/* Raw word at the native L2B ib2 offset (entry offset 44),
+-		 * useful even when the slot turned out to be another type.
++		/* Snapshot the candidate entry (including the raw words at
++		 * offsets 0..63) while the slot is locked, then classify it.
+ 		 */
+-		ib2 = READ_ONCE(hwe->l2b.ib2);
+-		state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, ib1);
+-		type = FIELD_GET(AIROHA_FOE_IB1_PKT_TYPE, ib1);
+-		bridge_slowpath =
+-			airoha_ppe_foe_is_bridge_slowpath(ppe, skb, hash, NULL);
++		airoha_ppe_l2b_dbg_capture_slot(hwe, &slot);
++		bridge_slowpath = airoha_ppe_foe_is_bridge_slowpath(ppe, skb,
++								    hash, NULL,
++								    &reject);
+ 	}
+ 	spin_unlock_bh(&ppe_lock);
+ 
+ 	if (!hwe) {
+ 		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.rx_no_slot);
+-		airoha_ppe_l2b_dbg_record(ppe, skb, hash, reason, 0, 0,
+-					  AIROHA_FOE_STATE_INVALID, 0,
++		airoha_ppe_l2b_dbg_record(ppe, skb, hash, reason, NULL,
+ 					  AIROHA_L2B_REJECT_NO_ENTRY);
+ 		return;
+ 	}
+ 
+-	if (state == AIROHA_FOE_STATE_BIND) {
++	if (slot.state == AIROHA_FOE_STATE_BIND) {
+ 		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.rx_no_slot);
+-		airoha_ppe_l2b_dbg_record(ppe, skb, hash, reason, ib1, ib2,
+-					  state, type, AIROHA_L2B_REJECT_BIND);
++		airoha_ppe_l2b_dbg_record(ppe, skb, hash, reason, &slot,
++					  AIROHA_L2B_REJECT_BIND);
+ 		return;
+ 	}
+ 
+ 	if (!bridge_slowpath) {
+ 		airoha_ppe_fdb_stat_inc(&ppe->fdb_stats.rx_no_slot);
+-		airoha_ppe_l2b_dbg_record(ppe, skb, hash, reason, ib1, ib2,
+-					  state, type, AIROHA_L2B_REJECT_TYPE);
++		airoha_ppe_l2b_dbg_record(ppe, skb, hash, reason, &slot,
++					  reject);
+ 		return;
+ 	}
+ 
++	/* Gate passed: the commit is about to be attempted for this slot. */
++	atomic64_inc(&ppe->l2b_dbg.accepted);
+ 	airoha_ppe_bridge_fdb_promote(ppe, skb, hash);
+ }
+ 
+@@ -2891,6 +2980,7 @@ int airoha_ppe_init(struct airoha_eth *eth)
+ {
+ 	int foe_size, err, ppe_num_stats_entries;
+ 	u32 ppe_num_entries;
++	unsigned int i;
+ 	struct airoha_ppe *ppe;
+ 
+ 	ppe = devm_kzalloc(eth->dev, sizeof(*ppe), GFP_KERNEL);
+@@ -2950,7 +3040,12 @@ int airoha_ppe_init(struct airoha_eth *eth)
+ 		goto error_l2_flow_table_destroy;
+ 
+ 	spin_lock_init(&ppe->l2b_dbg.lock);
+-	ppe->l2b_dbg.count = 0;
++	ppe->l2b_dbg.recorded = 0;
++	ppe->l2b_dbg.head = 0;
++	ppe->l2b_dbg.total = 0;
++	for (i = 0; i < ARRAY_SIZE(ppe->l2b_dbg.reject_count); i++)
++		atomic64_set(&ppe->l2b_dbg.reject_count[i], 0);
++	atomic64_set(&ppe->l2b_dbg.accepted, 0);
+ 
+ 	INIT_WORK(&ppe->npu_attach_work, airoha_ppe_npu_attach_work);
+ 
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+index d053e2e63..ee7321188 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -262,14 +262,17 @@ static const char *airoha_ppe_l2b_reject_str(u32 reject)
+ 		return "BIND";
+ 	case AIROHA_L2B_REJECT_TYPE:
+ 		return "TYPE";
++	case AIROHA_L2B_REJECT_KEY:
++		return "KEY";
+ 	default:
+ 		return "UNKNOWN";
+ 	}
+ }
+ 
+-/* Diagnostic snapshot of the bridge RX slow path. Reads the fixed ring filled
+- * by airoha_ppe_l2b_dbg_record() and the per-reason histogram. Nothing here
+- * touches the PPE, so the file is safe to read while traffic is running.
++/* Diagnostic snapshot of the bridge RX slow path. Reads the wrapping ring
++ * filled by airoha_ppe_l2b_dbg_record(), the per-reject counters and the
++ * per-reason histogram. Nothing here touches the PPE, so the file is safe to
++ * read while traffic is running.
+  */
+ static int airoha_ppe_debugfs_l2b_dbg_show(struct seq_file *m, void *private)
+ {
+@@ -277,35 +280,60 @@ static int airoha_ppe_debugfs_l2b_dbg_show(struct seq_file *m, void *private)
+ 	struct airoha_eth *eth = ppe->eth;
+ 	struct airoha_ppe_l2b_dbg *ring;
+ 	unsigned long flags;
+-	unsigned int count, i;
++	unsigned int recorded, head, start, i, j;
++	u64 total, reject[AIROHA_L2B_REJECT_MAX];
++	u64 accepted;
+ 
+ 	ring = kcalloc(AIROHA_PPE_L2B_DBG_MAX, sizeof(*ring), GFP_KERNEL);
+ 	if (!ring)
+ 		return -ENOMEM;
+ 
+ 	spin_lock_irqsave(&ppe->l2b_dbg.lock, flags);
+-	count = ppe->l2b_dbg.count;
+-	memcpy(ring, ppe->l2b_dbg.entry, count * sizeof(*ring));
++	recorded = ppe->l2b_dbg.recorded;
++	head = ppe->l2b_dbg.head;
++	total = ppe->l2b_dbg.total;
++	memcpy(ring, ppe->l2b_dbg.entry, sizeof(ppe->l2b_dbg.entry));
+ 	spin_unlock_irqrestore(&ppe->l2b_dbg.lock, flags);
+ 
+-	seq_printf(m, "recorded: %u / %u\n", count, AIROHA_PPE_L2B_DBG_MAX);
++	for (i = 0; i < ARRAY_SIZE(reject); i++)
++		reject[i] = atomic64_read(&ppe->l2b_dbg.reject_count[i]);
++	accepted = atomic64_read(&ppe->l2b_dbg.accepted);
++
++	seq_printf(m, "recorded: %u / %u total: %llu\n",
++		   recorded, AIROHA_PPE_L2B_DBG_MAX,
++		   (unsigned long long)total);
+ 	seq_printf(m, "fdb_rx_no_flow: %lu fdb_rx_no_slot: %lu fdb_promoted: %lu\n",
+ 		   ppe->fdb_stats.rx_no_flow, ppe->fdb_stats.rx_no_slot,
+ 		   ppe->fdb_stats.promoted);
++	seq_printf(m, "l2b_reject: RANGE=%llu NO_ENTRY=%llu BIND=%llu TYPE=%llu KEY=%llu ACCEPTED=%llu\n",
++		   (unsigned long long)reject[AIROHA_L2B_REJECT_RANGE],
++		   (unsigned long long)reject[AIROHA_L2B_REJECT_NO_ENTRY],
++		   (unsigned long long)reject[AIROHA_L2B_REJECT_BIND],
++		   (unsigned long long)reject[AIROHA_L2B_REJECT_TYPE],
++		   (unsigned long long)reject[AIROHA_L2B_REJECT_KEY],
++		   (unsigned long long)accepted);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(ppe->rx_reason_count); i++)
+ 		seq_printf(m, "reason[0x%02x]: %llu\n", i,
+ 			   (unsigned long long)atomic64_read(&ppe->rx_reason_count[i]));
+ 
+-	seq_puts(m, "idx ifindex hash reason ib1 ib2@44 state type bridge reject jiffies\n");
+-	for (i = 0; i < count; i++) {
+-		const struct airoha_ppe_l2b_dbg *e = &ring[i];
++	seq_puts(m, "seq idx ifindex hash reason ib1 ib2@44 state type bridge reject entry_dst entry_src skb_dst skb_src jiffies\n");
++	start = recorded == AIROHA_PPE_L2B_DBG_MAX ? head : 0;
++	for (i = 0; i < recorded; i++) {
++		unsigned int pos = (start + i) % AIROHA_PPE_L2B_DBG_MAX;
++		const struct airoha_ppe_l2b_dbg *e = &ring[pos];
+ 
+-		seq_printf(m, "%02u %u %04x %02x %08x %08x %u %u %u %s %lu\n",
+-			   i, e->ifindex, e->hash, e->reason, e->ib1, e->ib2,
+-			   e->state, e->type,
++		seq_printf(m, "%llu %02u %u %04x %02x %08x %08x %u %u %u %s %pM %pM %pM %pM %lu\n",
++			   (unsigned long long)e->seq, i, e->ifindex, e->hash,
++			   e->reason, e->ib1, e->ib2, e->state, e->type,
+ 			   e->type == PPE_PKT_TYPE_BRIDGE,
+-			   airoha_ppe_l2b_reject_str(e->reject), e->jiffies);
++			   airoha_ppe_l2b_reject_str(e->reject),
++			   e->entry_dst, e->entry_src,
++			   e->skb_dst, e->skb_src, e->jiffies);
++		for (j = 0; j < AIROHA_PPE_L2B_DBG_WORDS; j += 4)
++			seq_printf(m, "   raw+%02u: %08x %08x %08x %08x\n",
++				   j * 4, e->raw[j], e->raw[j + 1],
++				   e->raw[j + 2], e->raw[j + 3]);
+ 	}
+ 
+ 	for (i = 0; i < eth->soc->num_ppe; i++) {
