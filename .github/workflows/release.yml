@@ -12,6 +12,16 @@ on:
         required: true
         default: true
         type: boolean
+      timezone:
+        description: '固件默认时区 (IANA 名称如 Asia/Shanghai，或 POSIX 串如 CST-8；留空则 UTC)'
+        required: false
+        default: 'Asia/Shanghai'
+        type: string
+      root_password:
+        description: '固件默认 root 密码 (默认 root/root；清空此框则为无密码)'
+        required: false
+        default: 'root'
+        type: string
 
 permissions:
   contents: read
@@ -86,6 +96,12 @@ jobs:
             "configs/${{ matrix.target }}.config" \
             configs/release.config > .config
           make defconfig
+
+      - name: Apply firmware defaults (timezone / root password)
+        env:
+          PONWRT_TIMEZONE: ${{ inputs.timezone }}
+          PONWRT_ROOT_PASSWORD: ${{ inputs.root_password }}
+        run: python3 .github/scripts/firmware-defaults.py
 
       - name: Download sources
         run: make download -j"$(nproc)"

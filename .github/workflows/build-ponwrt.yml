@@ -3,6 +3,8 @@ name: Build PonWrt Firmware
 # 手动触发编译并发布到 GitHub Releases。
 # 使用方法：仓库 Actions 页 -> Build PonWrt Firmware -> Run workflow，
 # 默认只编译 AN7581 平台（含 FiberHome HG5382A），产物自动发布为 Release。
+# 固件默认时区与 root 密码可通过输入定制（.github/scripts/firmware-defaults.py
+# 生成 uci-defaults 烧入镜像；密码留空 = 无密码，默认 root/root）。
 
 on:
   workflow_dispatch:
@@ -31,6 +33,16 @@ on:
         description: 'Release 标签 (留空则自动使用 ponwrt-r<构建编号>)'
         required: false
         default: ''
+        type: string
+      timezone:
+        description: '固件默认时区 (IANA 名称如 Asia/Shanghai，或 POSIX 串如 CST-8；留空则 UTC)'
+        required: false
+        default: 'Asia/Shanghai'
+        type: string
+      root_password:
+        description: '固件默认 root 密码 (默认 root/root；清空此框则为无密码)'
+        required: false
+        default: 'root'
         type: string
       prerelease:
         description: '标记为预发布版本'
@@ -97,6 +109,12 @@ jobs:
         run: |
           ./scripts/kconfig.pl + configs/an7581.config configs/release.config > .config
           make defconfig
+
+      - name: Apply firmware defaults (timezone / root password)
+        env:
+          PONWRT_TIMEZONE: ${{ inputs.timezone }}
+          PONWRT_ROOT_PASSWORD: ${{ inputs.root_password }}
+        run: python3 .github/scripts/firmware-defaults.py
 
       - name: Download sources
         run: |
@@ -193,6 +211,12 @@ jobs:
           ./scripts/kconfig.pl + configs/an7583.config configs/release.config > .config
           make defconfig
 
+      - name: Apply firmware defaults (timezone / root password)
+        env:
+          PONWRT_TIMEZONE: ${{ inputs.timezone }}
+          PONWRT_ROOT_PASSWORD: ${{ inputs.root_password }}
+        run: python3 .github/scripts/firmware-defaults.py
+
       - name: Download sources
         run: |
           make download -j"$(nproc)" || make download -j1
@@ -266,6 +290,9 @@ jobs:
             echo "| 源码版本 | \`$SHORT_SHA\` |"
             echo "| 构建时间 | $DATE |"
             echo "| 目标平台 | $TARGETS |"
+            echo "| 默认时区 | ${{ inputs.timezone != '' && inputs.timezone || 'UTC' }} |"
+            echo "| 默认账号 | root |"
+            echo "| 默认密码 | ${{ inputs.root_password != '' && '已按构建输入设置' || '无密码' }} |"
             echo "| 构建配置 | 全设备 profile + release.config (nft-offload/CAKE/BBR/WireGuard/UPnP) |"
             echo ""
             echo "### 固件清单"
