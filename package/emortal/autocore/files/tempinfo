@@ -30,11 +30,24 @@ ipq40xx/*)
 esac
 
 if [ -n "$cpu_temp" ] && [ -z "$wifi_temp" ]; then
-	echo -n "CPU: $cpu_temp"
+	out="CPU: $cpu_temp"
 elif [ -z "$cpu_temp" ] && [ -n "$wifi_temp" ]; then
-	echo -n "WiFi: $wifi_temp"
+	out="WiFi: $wifi_temp"
 elif [ -n "$cpu_temp" ] && [ -n "$wifi_temp" ]; then
-	echo -n "CPU: $cpu_temp, WiFi: $wifi_temp"
+	out="CPU: $cpu_temp, WiFi: $wifi_temp"
 else
-	echo -n "No temperature info"
+	out=""
 fi
+
+# PON 光模块温度：取第一个 xpon 线路的前端温度；未装 ponctl/未配置线路时跳过
+if command -v ponctl >"/dev/null" 2>&1; then
+	pon_device="$(uci -q get pon.@xpon[0].device 2>"/dev/null")"
+	if [ -n "$pon_device" ]; then
+		pon_json="$(ponctl --device "$pon_device" status --json 2>"/dev/null")"
+		pon_temp="$(jsonfilter -s "$pon_json" -e '@.frontend.temperature_celsius' 2>"/dev/null")"
+		[ -n "$pon_temp" ] && pon_temp="$(awk -v t="$pon_temp" 'BEGIN { printf("%.1f°C", t) }')"
+		[ -n "$pon_temp" ] && out="${out:+$out, }PON: $pon_temp"
+	fi
+fi
+
+echo -n "${out:-No temperature info}"

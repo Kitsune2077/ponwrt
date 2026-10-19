@@ -1,0 +1,14 @@
+{
+	"luci-app-pon-overview": {
+		"description": "Grant access to PON overview card data sources",
+		"read": {
+			"ubus": {
+				"file": [ "read" ]
+			},
+			"file": {
+				"/proc/stat": [ "read" ],
+				"/usr/libexec/pon-overview-stats": [ "exec" ]
+			}
+		}
+	}
+}

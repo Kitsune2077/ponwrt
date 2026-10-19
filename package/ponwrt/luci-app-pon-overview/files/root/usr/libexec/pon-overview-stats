@@ -1,0 +1,13 @@
+#!/bin/sh
+# 概览页 PON 卡片脚注数据：conntrack 里 TCP/UDP 连接总数及已卸载数量。
+# flowtable 硬件/软件卸载的流会在 /proc/net/nf_conntrack 中带 [HW_OFFLOAD] /
+# [OFFLOAD] 标记。输出: tcp总数 tcp卸载数 udp总数 udp卸载数
+F="/proc/net/nf_conntrack"
+
+[ -r "$F" ] || exit 0
+
+awk '
+	$3 == "tcp" { tcp++;  if ($0 ~ /\[(HW_)?OFFLOAD\]/) tcpo++ }
+	$3 == "udp" { udp++;  if ($0 ~ /\[(HW_)?OFFLOAD\]/) udpo++ }
+	END { printf "%d %d %d %d\n", tcp + 0, tcpo + 0, udp + 0, udpo + 0 }
+' "$F" 2>"/dev/null"
