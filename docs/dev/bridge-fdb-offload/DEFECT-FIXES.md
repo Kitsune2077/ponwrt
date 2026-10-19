@@ -807,7 +807,157 @@ itself is correct.
   (`pcs-airoha-common.c:1426` and `airoha_ppe_debugfs.c:246`).
 - The image is built by the normal `make target/install` flow, not
   repacked, from the committed patch on this branch.
-- Not verified on hardware: whether the 300-frame test now raises
-  `fdb_promoted` and creates a BRIDGE entry. That is the next board step;
-  `fdb_rx_no_flow` and `fdb_promoted` should both rise and `l2b_dbg`'s
-  ACCEPTED counter should become non-zero.
+- Verified on hardware: the 300-frame non-IP test raised `fdb_promoted`
+  from 0 to 1, created a bound `L2B` entry and set `l2b_dbg`'s `ACCEPTED`
+  to 1. See Stage 8 for the measured entry, counters and the second-run
+  forwarding check.
+
+## Stage 8 — verified on hardware
+
+The 940 image (patches 931–940) produced the first successful bridge FDB
+promotion on the HG5382A. This section records what was measured on the
+board. It supersedes the "not verified on hardware" note at the end of
+Stage 7.
+
+### The 940 dispatch change
+
+Before 940, `HIT_UNBIND_RATE_REACHED` (CPU reason `0x0f`) still went to
+`airoha_ppe_check_skb()`, the sub-flow path. That path only commits a flow
+that already has an `l2_flows` entry; a pure bridge frame has none, so the
+hardware-learned L2B entry was never bound and `fdb_promoted` stayed 0.
+
+`940-net-airoha-route-rate-reached-to-bridge-slowpath.patch` tests the
+frame with `airoha_ppe_bridge_rx_is_candidate()` first and calls
+`airoha_ppe_bridge_rx_slowpath()` when it passes; otherwise the original
+`airoha_ppe_check_skb()` path runs unchanged. The `if`/`else` calls
+exactly one handler, so a frame cannot be committed by both paths.
+
+The candidate test requires:
+
+- ingress is a bridge port or a DSA conduit;
+- destination is unicast;
+- the NPU is attached;
+- the bridge FDB maps the destination MAC/VID to a valid airoha GDM
+  egress that is different from the ingress;
+- the egress action is untagged-in/untagged-out, i.e. it needs no VLAN
+  rewrite.
+
+The slow-path ownership gate is not relaxed: range, BIND state,
+native/software layout, MAC key and commit all stay under `ppe_lock`, and
+`RANGE`/`NO_ENTRY`/`BIND`/`TYPE`/`KEY`/`ACCEPTED` keep counting.
+
+### Why the test traffic must be non-IP
+
+The promoted frame was `Ether(type=0x88b5)/Raw(...)`, a non-IP Ethernet
+frame (`0x88b5` is a local/experimental EtherType). The PPE classifies
+IPv4/ICMP frames as IPv4 flows, not as `PPE_PKT_TYPE_BRIDGE`:
+
+- the 937 ring showed the ambient CPU-bound entries as `type=4/5`, i.e.
+  the IPv4 5-tuple/3-tuple layouts, and the 938/939 `KEY` check rejected
+  them because their L2B MAC offsets do not hold the test frame's MAC
+  pair;
+- the earlier IP/ICMP 300-frame run therefore never entered the bridge
+  L2B gate, no matter how many frames were sent. It produced no
+  promotion.
+
+A non-IP EtherType makes the PPE build the native L2B entry, which is the
+entry the RX slow path can bind. PPPoE session frames (`0x8864`) carry a
+PPP payload, not an IP header, at the bridge; they should follow the same
+non-IP/L2B classification. That is the target use case, but it is **not
+yet verified end to end** (see the scope table).
+
+### Measured promotion
+
+Test: 300 frames, `Ether(type=0x88b5)/Raw(...)`, source MAC
+`0c:9d:92:cb:8b:c5` on lan3 (DSA) to destination MAC
+`80:86:f2:01:cc:f0` on lan1 (GDM4), both untagged members of `br-lan`,
+about 10 ms between frames. No fibre was connected.
+
+Counters around the first run:
+
+```text
+fdb_promoted: 0 -> 1
+l2b_reject: ... ACCEPTED=1
+```
+
+`ACCEPTED` counts gate-accepted candidates whose commit was about to be
+attempted, not forwarded frames; here it advanced by one, matching the one
+promotion.
+
+`/sys/kernel/debug/ppe/entries` then contained the first bound bridge
+entry:
+
+```text
+01e6c BND   L2B eth=0c:9d:92:cb:8b:c5->80:86:f2:01:cc:f0 etype=0000 data=007f0000 vlan=0,0 ib1=6500005f ib2=0003e720 packets=0 bytes=0
+```
+
+Reading the dump (the fields are printed by
+`airoha_ppe_debugfs_foe_show()`):
+
+- `01e6c` is the PPE entry index, printed as `%05x`.
+- `BND` is `AIROHA_FOE_STATE_BIND`; `L2B` is the debugfs string for
+  `PPE_PKT_TYPE_BRIDGE`.
+- `eth=` is source MAC -> destination MAC, matching the test's sender and
+  receiver NICs.
+- `etype=0000` is the FOE `l2b.etype` metadata, **not** the frame's
+  EtherType. In this tree, for a GDM egress, the bridge promote path leaves
+  this field at zero; the field carries a PON GEM id or a DSA port bit for
+  those egresses, and `ETH_P_PPP_SES` only when PPPoE metadata was supplied
+  by a path that sets it. The bridge L2B template used here does not, so
+  the measured non-IP `0x88b5` flow shows `0000`. Do not grep for
+  `etype=88b5` (or `etype=8864`) to identify the flow.
+- `vlan=0,0` is consistent with untagged-in/untagged-out; no tag rewrite
+  was involved.
+- `packets=0 bytes=0` is the per-entry statistics snapshot at dump time;
+  it is not the delivery evidence for this test.
+
+### Second run — hardware forwarding
+
+The same 300 frames were sent again **without** rebooting, reloading the
+driver, flushing the FDB or otherwise touching the promoted flow:
+
+- 300/300 frames were captured on lan1;
+- `fdb_promoted` stayed at 1 (the promotion count is the number of
+  committed flows, not the number of forwarded frames);
+- `fdb_rx_no_flow` grew only by ambient traffic, not by the test frames.
+
+This is the forwarding proof. Every frame that is still punted to the
+bridge slow path increments `fdb_rx_no_flow` before the BIND-state check,
+and a still-unbound flow would increment `fdb_promoted` when it is
+committed. On the second run neither counter moved with the 300 frames
+while all 300 were delivered, so the bound L2B entry was forwarding them
+in the PPE and they were no longer taking the software-bridge path.
+
+### Scope after Stage 8
+
+| Case | Status | Evidence / limit |
+| --- | --- | --- |
+| Bridged unicast non-IP L2B (`0x88b5`), lan3 DSA -> lan1 GDM, untagged in/out | **Verified on hardware** | 300 frames promoted `fdb_promoted` 0 -> 1; `BND L2B` entry `01e6c`; second 300-frame run delivered 300/300 with `fdb_promoted` stable at 1 and no test-frame growth in `fdb_rx_no_flow`. |
+| PPPoE session (`0x8864`) | **Same L2B path by classification; end-to-end not yet verified** | PPPoE is non-IP at the bridge, so it is expected to take the L2B path, but no fibre/OLT/PPPoE session was available on this test bench. Nothing here proves PPPoE dial-up, forwarding or PON GEM mapping. |
+| IP/ICMP frames | **IP-flow path; out of scope** | The PPE classifies IPv4 as `type=4/5` (IPv4 5T/3T), not L2B. The earlier IP/ICMP run did not promote and is not a valid test of this feature. |
+| VLAN tag rewrite (802.1Q push/pop) | **Not done; out of scope** | Push is opt-in and has never been observed on hardware; pop is not implemented. 940 rejects tagged ingress and any egress action that needs a rewrite, so tagged frames stay in the software bridge. |
+
+### Not yet verified
+
+These are deliberately kept separate from the verified result above:
+
+- **PPPoE end to end over fibre.** No OLT/fibre was connected, so no PON
+  link, PPPoE discovery/session, upstream/downstream forwarding or
+  `%si` measurement was performed. The only claim is that `0x8864` is
+  non-IP and therefore belongs to the same L2B class as the verified
+  `0x88b5` traffic.
+- **PON egress and GEM/T-CONT mapping for a promoted bridge flow.** The
+  verified flow egresses lan1 (GDM4), not `pon0`. The bridge promote path
+  fills `data.vlan` only for a push, and the PON GEM lookup for an L2B
+  flow has not been exercised.
+- **VLAN tag rewrite.** Push/pop and tagged-to-tagged remain
+  unimplemented or unverified as described in Stages 2 and 8's scope
+  table.
+- **Ageing, teardown and re-promotion.** The flow was not aged out, and
+  the 934 worker is still inspection-only.
+- **More than one flow / more than one station.** Only a single promoted
+  MAC pair was observed.
+- **Throughput and CPU cost.** 300 frames at 10 ms is a functional test,
+  not a throughput or `%si` benchmark.
+- **Other AN7581 boards and silicon variants.** Only the HG5382A was
+  tested.
