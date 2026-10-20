@@ -1,11 +1,10 @@
 # miniupnpd 2.3.11 在上游 feed 处于不可构建状态（补丁未跟进）；处理方式是
 # 在 configs/release.config 里临时取消 luci-app-upnp（连带 miniupnpd），
 # feed 保持跟随 HEAD。上游修复后恢复 release.config 里的 UPnP 即可。
-# 2026-10-20 临时钉住：上游 10-19 的 70ac3a84 把 libffi 从本 feed 迁往 core repo，
-# 但我们的 core 树快照（含 pbs05 上游）还没有 package/libs/libffi —— 两头皆空，
-# python3 的 _ctypes 因缺 ffi.h 编译失败。钉在迁移前的 3b7cdf03；待上游 core 侧
-#（package/libs/libffi）可用了，或下次同步 pbs05:master 后放开即可。
-src-git packages https://github.com/immortalwrt/packages.git^3b7cdf03a6f22e91ae485e1ffdda1062da7a3431
+# libffi 已由上游从本 feed 迁往 core repo（70ac3a84）；我们树里 vendor 了
+# immortalwrt core 的 package/libs/libffi（3.4.7）跟随该迁移，feed 保持跟随 HEAD。
+# 下次同步 pbs05:master（届时其 core 树应已含 libffi）时可删除本地 vendor 副本。
+src-git packages https://github.com/immortalwrt/packages.git
 src-git luci https://github.com/immortalwrt/luci.git
 src-git routing https://github.com/openwrt/routing.git
 src-git telephony https://github.com/openwrt/telephony.git
