@@ -6,7 +6,10 @@ src-git luci https://github.com/immortalwrt/luci.git
 src-git routing https://github.com/openwrt/routing.git
 src-git telephony https://github.com/openwrt/telephony.git
 src-git video https://github.com/openwrt/video.git
-src-git pon_drivers https://github.com/pbs05/openwrt-pon-drivers.git
+# 2026-10-20 钉住到自己仓库的 feed 分支：airoha-xpon r68 叠加了 pbs05/ponwrt#49 的
+# MBI RX 溢出风暴自动复位补丁（详见 pon-drivers-feed 分支）。上游合并等价修复后
+# 改回 https://github.com/pbs05/openwrt-pon-drivers.git 即可。
+src-git pon_drivers https://github.com/Kitsune2077/ponwrt.git^fcbb67f69185e9b5a8efab4b52557fd0f06a9d75
 src-git pon_userspace https://github.com/pbs05/openwrt-pon-userspace.git
 #src-git targets https://github.com/openwrt/targets.git
 #src-git oldpackages http://git.openwrt.org/packages.git
