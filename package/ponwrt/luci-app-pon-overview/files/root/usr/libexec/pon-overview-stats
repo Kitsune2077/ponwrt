@@ -2,12 +2,33 @@
 # 概览页 PON 卡片脚注数据：conntrack 里 TCP/UDP 连接总数及已卸载数量。
 # flowtable 硬件/软件卸载的流会在 /proc/net/nf_conntrack 中带 [HW_OFFLOAD] /
 # [OFFLOAD] 标记。输出: tcp总数 tcp卸载数 udp总数 udp卸载数
+#
+# 概览页每 5 秒轮询一次，连接计数不需要那么新鲜：TTL 内直接回放缓存，
+# 避免每拍都 awk 全表扫描 nf_conntrack。缓存经临时文件原子写入，损坏或
+# 过期则重新扫描。
 F="/proc/net/nf_conntrack"
+C="/tmp/pon-overview-stats.cache"
+TTL=30
+
+now="$(date +%s)"
+
+if [ -r "$C" ]; then
+	read -r ts rest <"$C" 2>"/dev/null"
+	if [ "${ts:-0}" -ge "$((now - TTL))" ] 2>"/dev/null" && [ -n "$rest" ]; then
+		echo "$rest"
+		exit 0
+	fi
+fi
 
 [ -r "$F" ] || exit 0
 
-awk '
+out="$(awk '
 	$3 == "tcp" { tcp++;  if ($0 ~ /\[(HW_)?OFFLOAD\]/) tcpo++ }
 	$3 == "udp" { udp++;  if ($0 ~ /\[(HW_)?OFFLOAD\]/) udpo++ }
 	END { printf "%d %d %d %d\n", tcp + 0, tcpo + 0, udp + 0, udpo + 0 }
-' "$F" 2>"/dev/null"
+' "$F" 2>"/dev/null")"
+
+if [ -n "$out" ]; then
+	printf '%s %s\n' "$now" "$out" >"$C.$$" 2>"/dev/null" && mv "$C.$$" "$C" 2>"/dev/null"
+	echo "$out"
+fi

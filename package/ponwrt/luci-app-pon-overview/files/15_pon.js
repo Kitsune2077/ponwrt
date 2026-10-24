@@ -122,9 +122,18 @@ var cardStyle = '\
 	} \
 }';
 
-/* 轮询间的上下行速率采样与 /proc/stat 差值基线，均为页面级状态。 */
+/* 轮询间的上下行速率采样与 /proc/stat 差值基线，均为页面级状态。
+ * ponctl 快照与 conntrack 统计做页面级节流：概览页 5 秒一拍，而光模块
+ * 读数与连接计数变化远慢于此，每拍都拉起 ponctl/awk 进程只会把 ondemand
+ * 调度器顶在高频（SNAPSHOT_MS/STATS_MS 内直接复用上次结果；出错不缓存，
+ * 下一拍即重试。速率与 CPU 行仍每拍刷新——数据源本身免费）。 */
 var trafficPrev = {},
-    cpuPrev = null;
+    cpuPrev = null,
+    snapshotPrev = {},
+    statsPrev = null;
+
+var SNAPSHOT_MS = 20 * 1000,
+    STATS_MS = 30 * 1000;
 
 function execJSON(command, args) {
 	return L.resolveDefault(fs.exec_direct(command, args), null)
@@ -344,10 +353,19 @@ return baseclass.extend({
 				if (!device)
 					return Promise.resolve({ section: s, device: device, error: _('未配置设备') });
 
+				var cached = snapshotPrev[device];
+
+				if (cached != null && (Date.now() - cached.t) < SNAPSHOT_MS)
+					return Promise.resolve({ section: s, device: device, snapshot: cached.snapshot });
+
 				return execJSON('/usr/sbin/ponctl', [ '--device', device, 'status', '--json' ])
 					.then(function(snapshot) {
-						if (snapshot == null || snapshot.schema_version !== 1 || !snapshot.line)
+						if (snapshot == null || snapshot.schema_version !== 1 || !snapshot.line) {
+							snapshotPrev[device] = null;
 							return { section: s, device: device, error: _('无法读取 PON 线路状态') };
+						}
+
+						snapshotPrev[device] = { t: Date.now(), snapshot: snapshot };
 
 						return { section: s, device: device, snapshot: snapshot };
 					});
@@ -365,7 +383,14 @@ return baseclass.extend({
 
 					return map;
 				}),
-				L.resolveDefault(fs.exec_direct('/usr/libexec/pon-overview-stats'), null),
+				(statsPrev != null && (Date.now() - statsPrev.t) < STATS_MS)
+					? Promise.resolve(statsPrev.raw)
+					: L.resolveDefault(fs.exec_direct('/usr/libexec/pon-overview-stats'), null)
+						.then(function(raw) {
+							if (raw != null)
+								statsPrev = { t: Date.now(), raw: raw };
+							return raw;
+						}),
 				L.resolveDefault(fs.read('/proc/stat'), null)
 			]).then(function(results) {
 				return {

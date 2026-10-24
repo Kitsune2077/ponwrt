@@ -39,13 +39,31 @@ else
 	out=""
 fi
 
-# PON 光模块温度：取第一个 xpon 线路的前端温度；未装 ponctl/未配置线路时跳过
+# PON 光模块温度：取第一个 xpon 线路的前端温度；未装 ponctl/未配置线路时跳过。
+# 本脚本被概览页每 5 秒调用一次，而 ponctl+jsonfilter 是整页轮询里最贵的
+# 一项：模块温度变化远慢于轮询周期，用 TTL 缓存回放（经临时文件原子写入，
+# 失败不缓存、下一拍即重试）。
 if command -v ponctl >"/dev/null" 2>&1; then
 	pon_device="$(uci -q get pon.@xpon[0].device 2>"/dev/null")"
 	if [ -n "$pon_device" ]; then
-		pon_json="$(ponctl --device "$pon_device" status --json 2>"/dev/null")"
-		pon_temp="$(jsonfilter -s "$pon_json" -e '@.frontend.temperature_celsius' 2>"/dev/null")"
-		[ -n "$pon_temp" ] && pon_temp="$(awk -v t="$pon_temp" 'BEGIN { printf("%.1f°C", t) }')"
+		pon_temp=""
+		pon_cache="/tmp/pon-module-temp.cache"
+		now="$(date +%s)"
+		if [ -r "$pon_cache" ]; then
+			read -r cts ctemp <"$pon_cache" 2>"/dev/null"
+			if [ "${cts:-0}" -ge "$((now - 30))" ] 2>"/dev/null" && [ -n "$ctemp" ]; then
+				pon_temp="$ctemp"
+			fi
+		fi
+		if [ -z "$pon_temp" ]; then
+			pon_json="$(ponctl --device "$pon_device" status --json 2>"/dev/null")"
+			pon_temp="$(jsonfilter -s "$pon_json" -e '@.frontend.temperature_celsius' 2>"/dev/null")"
+			if [ -n "$pon_temp" ]; then
+				pon_temp="$(awk -v t="$pon_temp" 'BEGIN { printf("%.1f°C", t) }')"
+				printf '%s %s\n' "$now" "$pon_temp" >"$pon_cache.$$" 2>"/dev/null" \
+					&& mv "$pon_cache.$$" "$pon_cache" 2>"/dev/null"
+			fi
+		fi
 		[ -n "$pon_temp" ] && out="${out:+$out, }PON: $pon_temp"
 	fi
 fi
