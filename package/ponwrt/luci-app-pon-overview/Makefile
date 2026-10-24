@@ -6,7 +6,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-pon-overview
 PKG_VERSION:=1.1.0
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 
 PKG_LICENSE:=Apache-2.0
 PKG_MAINTAINER:=Kitsune2077 <km2077@foxmail.com>

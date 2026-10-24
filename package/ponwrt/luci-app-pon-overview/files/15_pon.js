@@ -32,6 +32,10 @@ var cardStyle = '\
 	border-radius: 8px; \
 	overflow: hidden; \
 	margin-bottom: .6em; \
+	/* 响应式断点按卡片自身宽度（容器查询）而非视口宽度判断：主题侧边栏 \
+	 * 占掉一截的中等宽度视口下，卡片可用宽度与视口宽度并不对应，按视口 \
+	 * 判断会出现"既不并排、也没按堆叠样式排"的中间态。 */ \
+	container-type: inline-size; \
 } \
 #pon_overview_status .pon-mod-header { \
 	background: #5a67d8; \
@@ -44,7 +48,7 @@ var cardStyle = '\
 	display: flex; \
 	align-items: center; \
 	justify-content: space-between; \
-	flex-wrap: wrap; \
+	/* 不换行：速率块始终在右，空间不足时由左侧数据列收缩 */ \
 	gap: 1em 2em; \
 	padding: .9em 1.2em; \
 } \
@@ -52,7 +56,8 @@ var cardStyle = '\
 	display: flex; \
 	flex-direction: column; \
 	gap: .35em; \
-	flex: 1 1 16em; \
+	flex: 1 1 auto; \
+	min-width: 0; \
 } \
 #pon_overview_status .pon-mod-row { display: flex; gap: .3em; } \
 #pon_overview_status .pon-mod-label { font-weight: 700; } \
@@ -77,7 +82,23 @@ var cardStyle = '\
 } \
 #pon_overview_status .pon-mod-footer b { font-size: 1.15em; } \
 #pon_overview_status .pon-mod-offload { color: #3fb950; font-weight: 700; } \
-@media (max-width: 640px) { \
+/* 卡片不够宽时逐级压缩字号与间距，保住左右分栏 */ \
+@container (max-width: 26em) { \
+	#pon_overview_status .pon-mod-body { gap: .8em 1em; padding: .8em 1em; } \
+	#pon_overview_status .pon-mod-row { gap: .25em; } \
+	#pon_overview_status .pon-mod-rates { gap: .45em; } \
+	#pon_overview_status .pon-mod-rate { gap: .35em; } \
+	#pon_overview_status .pon-mod-rate-num { font-size: 1.15em; } \
+	#pon_overview_status .pon-mod-rate-unit { font-size: .7em; } \
+} \
+@container (max-width: 22em) { \
+	#pon_overview_status .pon-mod-body { gap: .7em .8em; padding: .75em .85em; } \
+	#pon_overview_status .pon-mod-rows { font-size: .95em; gap: .3em; } \
+	#pon_overview_status .pon-mod-rate-num { font-size: 1em; } \
+	#pon_overview_status .pon-mod-rate-unit { font-size: .65em; } \
+} \
+/* 极窄兜底：并排会挤压数据行折行（约 260px 卡宽以下）才退回上下堆叠 */ \
+@container (max-width: 19em) { \
 	#pon_overview_status .pon-mod-body { flex-direction: column; align-items: stretch; } \
 	#pon_overview_status .pon-mod-rates { \
 		flex-direction: row; \
@@ -85,6 +106,19 @@ var cardStyle = '\
 		text-align: center; \
 		border-top: 1px solid rgba(128, 128, 128, .15); \
 		padding-top: .7em; \
+	} \
+} \
+/* 不支持容器查询的老浏览器按视口宽度退回旧的堆叠样式 */ \
+@media (max-width: 640px) { \
+	@supports not (container-type: inline-size) { \
+		#pon_overview_status .pon-mod-body { flex-direction: column; align-items: stretch; } \
+		#pon_overview_status .pon-mod-rates { \
+			flex-direction: row; \
+			justify-content: space-around; \
+			text-align: center; \
+			border-top: 1px solid rgba(128, 128, 128, .15); \
+			padding-top: .7em; \
+		} \
 	} \
 }';
 
