@@ -1,18 +1,13 @@
-# miniupnpd 2.3.11 在上游 feed 处于不可构建状态（补丁未跟进）；处理方式是
-# 在 configs/release.config 里临时取消 luci-app-upnp（连带 miniupnpd），
-# feed 保持跟随 HEAD。上游修复后恢复 release.config 里的 UPnP 即可。
-# libffi 已由上游从本 feed 迁往 core repo（70ac3a84）；我们树里 vendor 了
-# immortalwrt core 的 package/libs/libffi（3.4.7）跟随该迁移，feed 保持跟随 HEAD。
-# 下次同步 pbs05:master（届时其 core 树应已含 libffi）时可删除本地 vendor 副本。
 src-git packages https://github.com/immortalwrt/packages.git
 src-git luci https://github.com/immortalwrt/luci.git
 src-git routing https://github.com/openwrt/routing.git
 src-git telephony https://github.com/openwrt/telephony.git
 src-git video https://github.com/openwrt/video.git
-# 2026-10-20 钉住到自己仓库的 feed 分支：airoha-xpon r68 叠加了 pbs05/ponwrt#49 的
-# MBI RX 溢出风暴自动复位补丁（详见 pon-drivers-feed 分支）。上游合并等价修复后
-# 改回 https://github.com/pbs05/openwrt-pon-drivers.git 即可。
-src-git pon_drivers https://github.com/Kitsune2077/ponwrt.git^fcbb67f69185e9b5a8efab4b52557fd0f06a9d75
+# 2026-10-23 钉住到自己仓库的 feed 分支：基于上游 main@2f248394（含 deferred
+# probe 死锁修复 openwrt-pon-drivers#9）叠加 pbs05/ponwrt#49 的 MBI RX 溢出风暴
+# 自动复位补丁，airoha-xpon 升为 r69（详见 pon-drivers-feed 分支）。上游合并等价
+# 的 MBI 修复后改回 https://github.com/pbs05/openwrt-pon-drivers.git 即可。
+src-git pon_drivers https://github.com/Kitsune2077/ponwrt.git^acd4804aabf2d916fbc41d95c06a7bacdd69481b
 src-git pon_userspace https://github.com/pbs05/openwrt-pon-userspace.git
 #src-git targets https://github.com/openwrt/targets.git
 #src-git oldpackages http://git.openwrt.org/packages.git
