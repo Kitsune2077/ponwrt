@@ -7,6 +7,18 @@ name: Build PonWrt Firmware
 # 生成 uci-defaults 烧入镜像；密码留空 = 无密码，默认 root/root）。
 
 on:
+  # 固件相关路径的推送自动构建（文档/README 改动不会触发，避免白跑 3 小时）。
+  # 手动触发仍然可用：Actions -> Build PonWrt Firmware -> Run workflow。
+  push:
+    branches: [ master ]
+    paths:
+      - 'target/**'
+      - 'package/**'
+      - 'configs/**'
+      - 'include/**'
+      - 'toolchain/**'
+      - 'feeds.conf.default'
+      - '.github/workflows/build-ponwrt.yml'
   workflow_dispatch:
     inputs:
       build_an7581:
